@@ -97,29 +97,29 @@ def extract_samples(rows: List[Dict[str, Any]], image_root: Path) -> List[Dict[s
             if not isinstance(t, dict):
                 continue
 
-            prompt = None
+            question = None
             label = None
 
             # 显式字段优先
             if "safe_instruction" in t and t["safe_instruction"]:
-                prompt = str(t["safe_instruction"]).strip()
+                question = str(t["safe_instruction"]).strip()
                 label = 1
             elif "unsafe_instruction" in t and t["unsafe_instruction"]:
-                prompt = str(t["unsafe_instruction"]).strip()
+                question = str(t["unsafe_instruction"]).strip()
                 label = 0
             elif "instruction" in t and t["instruction"]:
-                prompt = str(t["instruction"]).strip()
+                question = str(t["instruction"]).strip()
                 # 回退到样本级 safe 标记
                 if isinstance(safe_flag, bool):
                     label = 1 if safe_flag else 0
 
-            if not prompt or label is None:
+            if not question or label is None:
                 continue
 
             samples.append({
                 "id": f"{rid}_{j}",
                 "image_path": str(img_path),
-                "prompt": prompt,
+                "question": question,
                 "label": label,
             })
 
@@ -193,10 +193,10 @@ def main():
     write_jsonl(out_dir / "test_mm.jsonl", test_samples)
 
     # 文本兼容格式（你当前项目现有脚本可直接吃）
-    train_unsafe = [x["prompt"] for x in train_samples if x["label"] == 0]
-    train_safe = [x["prompt"] for x in train_samples if x["label"] == 1]
-    test_unsafe = [x["prompt"] for x in test_samples if x["label"] == 0]
-    test_safe = [x["prompt"] for x in test_samples if x["label"] == 1]
+    train_unsafe = [x["question"] for x in train_samples if x["label"] == 0]
+    train_safe = [x["question"] for x in train_samples if x["label"] == 1]
+    test_unsafe = [x["question"] for x in test_samples if x["label"] == 0]
+    test_safe = [x["question"] for x in test_samples if x["label"] == 1]
 
     write_txt(out_dir / "text_compat/data/custom.txt", train_unsafe)
     write_txt(out_dir / "text_compat/data_harmless/custom.txt", train_safe)
