@@ -36,6 +36,13 @@ BAD_WORDS = [
     ' ON', "I' " # for vicuna
 ]
 
+def load_checkpoint_state_dict(path):
+    try:
+        ckpt = torch.load(path, map_location="cpu", weights_only=True)
+    except TypeError:
+        ckpt = torch.load(path, map_location="cpu")
+    return ckpt["projector"] if isinstance(ckpt, dict) and "projector" in ckpt else ckpt
+
 
 def prepend_sys_prompt(sentence, args):
     messages = [{'role': 'user', 'content': sentence.strip()}]
@@ -77,22 +84,19 @@ def process_soft_prompt_as_word_embedding(
 
 def generate(inputs, model, toker, max_new_tokens, n_samples, temp, top_p, stop_token_ids, stop_str,
              enable_vision=False,vl_adapter=None,image_processor=None,image_path=None):
-    qdx, (seed, query, messages) = inputs
+    qdx, payload = inputs
+    if len(payload) == 4:
+        seed, query, messages, sample_image_path = payload
+    else:
+        seed, query, messages = payload
+        sample_image_path = None
+
     if seed is None:
         set_seed(qdx)
     else:
         set_seed(seed)
 
     input_text = toker.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
-    print(f"input_text: '{input_text}'")
-    tokens = toker.tokenize(input_text)
-    print(f"tokens: {tokens}")
-    input_ids = torch.tensor(toker.convert_tokens_to_ids(tokens), dtype=torch.long).unsqueeze(0).to(model.device)
-    print(f"input_ids shape: {input_ids.shape}")
-    #input_ids = torch.tensor(
-    #    toker.convert_tokens_to_ids(toker.tokenize(input_text)),
-    #    dtype=torch.long,
-    #).unsqueeze(0).to(model.device)
 
     # directly tokenizing words would produce an extra space, so remove it
     bad_words_ids = []
@@ -104,16 +108,16 @@ def generate(inputs, model, toker, max_new_tokens, n_samples, temp, top_p, stop_
         bad_words_ids = None
 
     if enable_vision:
-        if image_path is None:
-            raise ValueError("--enable_vision=True requires --image_path")
-        text_input_ids,text_attention_mask=prepare_text_input_ids(tokenizer=toker,messages=messages,device=model.device)
-        pixel_values=vl_adapter.preprocess_images([image_path],image_processor)
+        actual_image_path = sample_image_path if sample_image_path is not None else image_path
+        if actual_image_path is None:
+            raise ValueError("--enable_vision=True requires --image_path (or --mm_jsonl rows with image_path)")
+        text_input_ids = prepare_text_input_ids(tokenizer=toker, messages=messages, device=model.device)
+        pixel_values=vl_adapter.preprocess_images([actual_image_path],image_processor)
         visual_embeds=vl_adapter.encode_visual_tokens(pixel_values)
         mm_inputs=build_mm_inputs(
             llm_model=model,
             text_input_ids=text_input_ids,
             visual_embeds=visual_embeds,
-            text_attention_mask=text_attention_mask,
         )
 
         generations = model.generate(
@@ -224,7 +228,8 @@ def main():
     parser.add_argument("--projector_path", type=str, default=None)
     parser.add_argument("--image_path", type=str, default=None)
     parser.add_argument("--output_path", type=str, default='./outputs')
-    
+    parser.add_argument("--mm_jsonl", type=str, default=None)
+
     args = parser.parse_args()
 
     if sum([args.use_soft_prompt,
@@ -241,6 +246,8 @@ def main():
         raise ValueError("Only one of --use_malicious/--use_advbench/--use_alpaca and --use_testset can be set to True")
     if args.use_testset and not args.use_harmless:
         raise ValueError("--use_testset must be used with --use_harmless")
+    if args.use_soft_prompt and (args.prompt_length is None or args.system_prompt_type is None):
+        raise ValueError("--use_soft_prompt requires both --prompt_length and --system_prompt_type")
 
     # prepare toker
     model_name = args.model_name = args.pretrained_model_path.split('/')[-1]
@@ -337,8 +344,9 @@ def main():
     for k, v in vars(args).items():
         logging.info(f"{k}: {v}")
 
-    if os.path.exists(f"{args.output_path}/{fname}/output_sampling.csv" if args.use_sampling else f"{args.output_path}/{fname}/output_greedy.csv"):
-        logging.info(f"File {args.output_path}/{fname}/output_sampling.csv exists, skipping")
+    output_file = f"{args.output_path}/{fname}/output_sampling.csv" if args.use_sampling else f"{args.output_path}/{fname}/output_greedy.csv"
+    if os.path.exists(output_file):
+        logging.info(f"File {output_file} exists, skipping")
         return
 
     # prepare model
@@ -384,8 +392,8 @@ def main():
     if args.enable_vision:
         if args.vision_model_path is None:
             raise ValueError("--enable_vision requires --vision_model_path")
-        if args.image_path is None:
-            raise ValueError("--enable_vision requires --image_path")
+        if args.image_path is None and args.mm_jsonl is None:
+            raise ValueError("--enable_vision requires --image_path or --mm_jsonl")
         llm_hidden_size = model.get_input_embeddings().embedding_dim
         vision_model, image_processor, projector = load_vision_components(
             vision_model_path=args.vision_model_path,
@@ -395,19 +403,50 @@ def main():
             dtype=model.dtype,
         )
         if args.projector_path is not None:
-            ckpt = torch.load(args.projector_path, map_location="cpu")
-            state_dict = ckpt["projector"] if isinstance(ckpt, dict) and "projector" in ckpt else ckpt
+            state_dict = load_checkpoint_state_dict(args.projector_path)
             projector.load_state_dict(state_dict, strict=True)
         vl_adapter = VisionLanguageAdapter(vision_model=vision_model, projector=projector).to(model.device)
         vl_adapter.eval()
 
     # prepend sys prompt
-    all_queries = [l.strip() for l in lines]
+    all_image_paths = None
+    if args.mm_jsonl is not None:
+        mm_rows = []
+        skipped_missing_images = 0
+        with open(args.mm_jsonl, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                row = json.loads(line)
+                if "image_path" not in row or "question" not in row:
+                    continue
+                question = str(row["question"]).strip()
+                if len(question) == 0:
+                    continue
+                if args.enable_vision and not os.path.exists(row["image_path"]):
+                    skipped_missing_images += 1
+                    continue
+                mm_rows.append({"question": question, "image_path": row["image_path"]})
+
+        if len(mm_rows) == 0:
+            raise ValueError(f"No valid rows with question/image_path found in {args.mm_jsonl}")
+        if skipped_missing_images > 0:
+            logging.warning(f"Skipped {skipped_missing_images} rows with missing image files in {args.mm_jsonl}")
+
+        all_queries = [e["question"] for e in mm_rows]
+        all_image_paths = [e["image_path"] for e in mm_rows]
+    else:
+        all_queries = [l.strip() for l in lines]
+
     all_messages = [prepend_sys_prompt(l, args) for l in all_queries]
+
     if args.use_gcg:
         with open(f"{data_path}/advbench.txt") as f:
             lines = f.readlines()[:100]
+        all_image_paths = None
         all_queries = [l.strip() for l in lines]
+        all_messages = [prepend_sys_prompt(l, args) for l in all_queries]
 
     logging.info(f"Running")
     prompts = []
@@ -453,16 +492,27 @@ def main():
 
     seeds = [None] * len(all_queries) # by default, we use qdx
     pbar = tqdm(total=len(all_queries), dynamic_ncols=True)
-    for res in pool.imap(generate_fn, enumerate(zip(seeds, all_queries, all_messages)), chunksize=1):
-        qdx, query, input_text, generated_texts = res
-        if qdx < 5:
-            logging.info(f"\nQuery: {query}")
-            logging.info(f"\nInput: {input_text}")
-            logging.info(f"\nOutput: {generated_texts[0]}\n")
-        inputs.extend([input_text] * args.n_samples)
-        outputs.extend(generated_texts)
-        prompts.extend([query] * args.n_samples)
-        pbar.update(1)
+    
+    if all_image_paths is not None:
+        packed = zip(seeds, all_queries, all_messages, all_image_paths)
+    else:
+        packed = zip(seeds, all_queries, all_messages)
+    
+    try:
+        for res in pool.imap(generate_fn, enumerate(packed), chunksize=1):
+            qdx, query, input_text, generated_texts = res
+            if qdx < 5:
+                logging.info(f"\nQuery: {query}")
+                logging.info(f"\nInput: {input_text}")
+                logging.info(f"\nOutput: {generated_texts[0]}\n")
+            inputs.extend([input_text] * args.n_samples)
+            outputs.extend(generated_texts)
+            prompts.extend([query] * args.n_samples)
+            pbar.update(1)
+    finally:
+        pool.close()
+        pool.join()
+        pbar.close()
 
     results = pd.DataFrame()
     results["prompt"] = prompts

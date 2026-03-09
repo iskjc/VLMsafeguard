@@ -53,6 +53,8 @@ class VisionLanguageAdapter(nn.Module):
         self.projector = projector
 
     def encode_visual_tokens(self, pixel_values: Tensor) -> Tensor:
+        vision_param = next(self.vision_model.parameters())
+        pixel_values = pixel_values.to(device=vision_param.device, dtype=vision_param.dtype)
         outputs = self.vision_model(pixel_values=pixel_values, output_hidden_states=False, return_dict=True)
         if hasattr(outputs, "last_hidden_state"):
             vis = outputs.last_hidden_state
@@ -60,6 +62,7 @@ class VisionLanguageAdapter(nn.Module):
             vis = outputs.vision_model_output.last_hidden_state
         else:
             raise ValueError("Cannot find vision last_hidden_state in vision model outputs")
+        return self.projector(vis)
 
 
     @torch.no_grad()
@@ -141,9 +144,20 @@ def load_vision_components(
     Returns (vision_model, image_processor, projector).
     """
 
-    from transformers import AutoModel, AutoImageProcessor
+    from transformers import AutoModel, AutoImageProcessor, CLIPVisionModel
 
-    vision_model = AutoModel.from_pretrained(vision_model_path)
+    vision_model = None
+    try:
+        vision_model = CLIPVisionModel.from_pretrained(vision_model_path)
+    except Exception:
+        base_model = AutoModel.from_pretrained(vision_model_path)
+        # Some checkpoints (e.g. CLIPModel) bundle both text and vision towers.
+        # We only need the vision tower for multimodal prefix construction.
+        if hasattr(base_model, "vision_model"):
+            vision_model = base_model.vision_model
+        else:
+            vision_model = base_model
+
     image_processor = AutoImageProcessor.from_pretrained(vision_model_path)
 
     vision_hidden_size = getattr(vision_model.config, "hidden_size", None)
