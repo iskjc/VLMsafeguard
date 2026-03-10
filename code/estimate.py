@@ -91,7 +91,11 @@ def main():
     # prepare model
     model_name = args.pretrained_model_path.split('/')[-1]
     config = AutoConfig.from_pretrained(args.pretrained_model_path)
-    num_layers = config.num_hidden_layers
+    num_layers = getattr(config, "num_hidden_layers", None)
+    if num_layers is None and hasattr(config, "text_config"):
+        num_layers = getattr(config.text_config, "num_hidden_layers", None)
+    if num_layers is None:
+        raise ValueError("Cannot infer num_hidden_layers from model config")
     os.makedirs(f'{args.output_path}/{model_name}_{args.system_prompt_type}', exist_ok=True)
 
     # harmful

@@ -3,7 +3,15 @@ import json
 import pandas as pd
 import numpy as np
 import argparse
-from transformers import AutoTokenizer, AutoModelForCausalLM, set_seed
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    AutoProcessor,
+    AutoImageProcessor,
+    LlavaForConditionalGeneration,
+    LlavaProcessor,
+    set_seed,
+)
 from transformers import PreTrainedModel, PreTrainedTokenizer, PreTrainedTokenizerFast
 import torch
 import torch.nn as nn
@@ -83,7 +91,8 @@ def process_soft_prompt_as_word_embedding(
 
 
 def generate(inputs, model, toker, max_new_tokens, n_samples, temp, top_p, stop_token_ids, stop_str,
-             enable_vision=False,vl_adapter=None,image_processor=None,image_path=None):
+             enable_vision=False,vl_adapter=None,image_processor=None,image_path=None,
+             is_llava=False,llava_processor=None):
     qdx, payload = inputs
     if len(payload) == 4:
         seed, query, messages, sample_image_path = payload
@@ -96,18 +105,67 @@ def generate(inputs, model, toker, max_new_tokens, n_samples, temp, top_p, stop_
     else:
         set_seed(seed)
 
-    input_text = toker.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+    if is_llava:
+        # Keep this prompt format simple and robust for llava-1.5 checkpoints.
+        system_text = "\n".join([m["content"] for m in messages if m["role"] == "system"]).strip()
+        user_text = "\n".join([m["content"] for m in messages if m["role"] == "user"]).strip()
+        merged_user = f"{system_text}\n\n{user_text}".strip() if len(system_text) > 0 else user_text
+        if enable_vision:
+            input_text = f"USER: <image>\n{merged_user}\nASSISTANT:"
+        else:
+            input_text = f"USER: {merged_user}\nASSISTANT:"
+    else:
+        input_text = toker.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
 
     # directly tokenizing words would produce an extra space, so remove it
     bad_words_ids = []
-    for t in BAD_WORDS:
-        ids = toker.convert_tokens_to_ids(toker.tokenize(t)[1:])
-        if len(ids) > 0:
-            bad_words_ids.append(ids)
+    if not is_llava:
+        for t in BAD_WORDS:
+            ids = toker.convert_tokens_to_ids(toker.tokenize(t)[1:])
+            if len(ids) > 0:
+                bad_words_ids.append(ids)
     if len(bad_words_ids) == 0:
         bad_words_ids = None
 
-    if enable_vision:
+    if is_llava:
+        llava_device = next(model.parameters()).device
+        if enable_vision:
+            actual_image_path = sample_image_path if sample_image_path is not None else image_path
+            if actual_image_path is None:
+                raise ValueError("LLaVA with --enable_vision requires --image_path or --mm_jsonl with image_path")
+            from PIL import Image
+            pil_image = Image.open(actual_image_path).convert("RGB")
+            model_inputs = llava_processor(images=pil_image, text=input_text, return_tensors="pt")
+        else:
+            model_inputs = llava_processor(text=input_text, return_tensors="pt")
+
+        safe_model_inputs = {}
+        for k, v in model_inputs.items():
+            if v is None:
+                continue
+            if not torch.is_tensor(v):
+                safe_model_inputs[k] = v
+                continue
+            if torch.is_floating_point(v):
+                safe_model_inputs[k] = v.to(device=llava_device, dtype=model.dtype)
+            else:
+                safe_model_inputs[k] = v.to(device=llava_device)
+        model_inputs = safe_model_inputs
+        prompt_len = model_inputs["input_ids"].size(1)
+        generations = model.generate(
+            **model_inputs,
+            min_new_tokens=10,
+            max_new_tokens=max_new_tokens,
+            do_sample=True if temp > 0 else False,
+            temperature=temp if temp > 0 else 1.0,
+            top_p=top_p,
+            top_k=50,
+            num_return_sequences=n_samples,
+            eos_token_id=stop_token_ids,
+            pad_token_id=toker.eos_token_id,
+            return_dict_in_generate=True,
+        )
+    elif enable_vision:
         actual_image_path = sample_image_path if sample_image_path is not None else image_path
         if actual_image_path is None:
             raise ValueError("--enable_vision=True requires --image_path (or --mm_jsonl rows with image_path)")
@@ -128,7 +186,7 @@ def generate(inputs, model, toker, max_new_tokens, n_samples, temp, top_p, stop_
             do_sample=True if temp > 0 else False,
             temperature=temp if temp > 0 else 1.0,
             top_p=top_p,
-            top_k=50, # consistent with hf default value
+            top_k=50, 
             num_return_sequences=n_samples,
             eos_token_id=stop_token_ids,
             pad_token_id=toker.eos_token_id,
@@ -252,8 +310,11 @@ def main():
     # prepare toker
     model_name = args.model_name = args.pretrained_model_path.split('/')[-1]
     toker = AutoTokenizer.from_pretrained(args.pretrained_model_path, use_fast=False)
+    is_llava = ('llava' in model_name.lower())
 
-    if 'Llama-2-' in model_name and '-chat' in model_name:
+    if is_llava:
+        generation_config = {"stop_token_ids": None, "stop_str": None}
+    elif 'Llama-2-' in model_name and '-chat' in model_name:
         generation_config_file = './generation_configs/llama-2-chat.json'
     elif 'CodeLlama-' in model_name and '-Instruct' in model_name:
         generation_config_file = './generation_configs/llama-2-chat.json'
@@ -267,11 +328,12 @@ def main():
         generation_config_file = './generation_configs/openchat.json'
     else:
         raise ValueError(f"Unsupported or untuned model: {model_name}")
-    generation_config = json.load(open(generation_config_file))
-    chat_template_file = generation_config['chat_template']
-    chat_template = open(chat_template_file).read()
-    chat_template = chat_template.replace('    ', '').replace('\n', '')
-    toker.chat_template = chat_template
+    if not is_llava:
+        generation_config = json.load(open(generation_config_file))
+        chat_template_file = generation_config['chat_template']
+        chat_template = open(chat_template_file).read()
+        chat_template = chat_template.replace('    ', '').replace('\n', '')
+        toker.chat_template = chat_template
 
     stop_token_ids = generation_config['stop_token_ids']
     if stop_token_ids is None:
@@ -350,23 +412,54 @@ def main():
         return
 
     # prepare model
-    model = AutoModelForCausalLM.from_pretrained(
-        args.pretrained_model_path,
-        torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported()
-                and not ((('Orca-2-' in model_name and args.use_soft_prompt)
-                          or ('vicuna-' in model_name and not args.use_soft_prompt)
-                          ) and args.use_testset)
-                else torch.float32,
-        use_safetensors=True,
-        device_map="auto",
-        attn_implementation="eager"
+    model_dtype = (
+        torch.bfloat16 if torch.cuda.is_bf16_supported()
+        and not ((('Orca-2-' in model_name and args.use_soft_prompt)
+                  or ('vicuna-' in model_name and not args.use_soft_prompt)
+                  ) and args.use_testset)
+        else torch.float32
     )
+    if is_llava:
+        model = LlavaForConditionalGeneration.from_pretrained(
+            args.pretrained_model_path,
+            torch_dtype=model_dtype,
+            use_safetensors=True,
+            device_map="auto",
+        )
+        try:
+            llava_processor = AutoProcessor.from_pretrained(
+                args.pretrained_model_path,
+                use_fast=False,
+            )
+        except Exception as e:
+            logging.warning(f"AutoProcessor load failed ({type(e).__name__}): {e}")
+            logging.warning("Falling back to LlavaProcessor(image_processor + slow tokenizer).")
+            llava_image_processor = AutoImageProcessor.from_pretrained(args.pretrained_model_path)
+            llava_tokenizer = AutoTokenizer.from_pretrained(args.pretrained_model_path, use_fast=False)
+            llava_processor = LlavaProcessor(
+                image_processor=llava_image_processor,
+                tokenizer=llava_tokenizer,
+            )
+        # Keep tokenizer usage consistent for decode/postprocess path.
+        if hasattr(llava_processor, "tokenizer") and llava_processor.tokenizer is not None:
+            toker = llava_processor.tokenizer
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.pretrained_model_path,
+            torch_dtype=model_dtype,
+            use_safetensors=True,
+            device_map="auto",
+            attn_implementation="eager"
+        )
+        llava_processor = None
 
     logging.info(f"Model name: {model_name}")
     logging.info(f"Model size: {model.get_memory_footprint()/1e9}")
     logging_cuda_memory_usage()
 
     if args.use_soft_prompt:
+        if is_llava:
+            raise ValueError("--use_soft_prompt is not supported with LLaVA models in this script")
         if args.do_data_ablation:
             soft_prompt_file = f'./trained_prompts_ablation/{model_name}/type.{args.system_prompt_type}_length.{args.prompt_length}.safetensors'
         elif args.do_unlikelihood:
@@ -389,7 +482,7 @@ def main():
     #增加视觉模块
     vl_adapter = None
     image_processor = None
-    if args.enable_vision:
+    if args.enable_vision and not is_llava:
         if args.vision_model_path is None:
             raise ValueError("--enable_vision requires --vision_model_path")
         if args.image_path is None and args.mm_jsonl is None:
@@ -473,6 +566,8 @@ def main():
             vl_adapter=vl_adapter,
             image_processor=image_processor,
             image_path=args.image_path,
+            is_llava=is_llava,
+            llava_processor=llava_processor,
         )
     else:
         generate_fn = partial(
@@ -486,6 +581,8 @@ def main():
             vl_adapter=vl_adapter,
             image_processor=image_processor,
             image_path=args.image_path,
+            is_llava=is_llava,
+            llava_processor=llava_processor,
         )
 
     pool = ThreadPool(1)

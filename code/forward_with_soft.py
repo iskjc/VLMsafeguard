@@ -3,7 +3,7 @@ import json
 import pandas as pd
 import numpy as np
 import argparse
-from transformers import AutoTokenizer, AutoModelForCausalLM, set_seed
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoProcessor, LlavaForConditionalGeneration
 import torch
 import logging
 from tqdm import tqdm
@@ -31,16 +31,27 @@ def prepend_sys_prompt(sentence, prompt_length):
     return messages
 
 
-def forward(model, toker, messages):
-    input_text = toker.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+def build_llava_prompt(messages):
+    system_text = "\n".join([m["content"] for m in messages if m["role"] == "system"]).strip()
+    user_text = "\n".join([m["content"] for m in messages if m["role"] == "user"]).strip()
+    merged_user = f"{system_text}\n\n{user_text}".strip() if len(system_text) > 0 else user_text
+    return f"USER: {merged_user}\nASSISTANT:"
+
+
+def forward(model, toker, messages, is_llava=False):
+    if is_llava:
+        input_text = build_llava_prompt(messages)
+    else:
+        input_text = toker.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+    model_device = model.get_input_embeddings().weight.device if is_llava else model.device
     input_ids = torch.tensor(
         toker.convert_tokens_to_ids(toker.tokenize(input_text)),
         dtype=torch.long,
-    ).unsqueeze(0).to(model.device)
+    ).unsqueeze(0).to(model_device)
 
     outputs = model(
         input_ids,
-        attention_mask=input_ids.new_ones(input_ids.size(), dtype=model.dtype),
+        attention_mask=input_ids.new_ones(input_ids.size(), dtype=torch.long),
         return_dict=True,
         output_hidden_states=True,
     )
@@ -71,46 +82,60 @@ def main():
 
     # prepare model
     model_name = args.model_name = args.pretrained_model_path.split('/')[-1]
+    is_llava = 'llava' in model_name.lower()
 
-    model = AutoModelForCausalLM.from_pretrained(
-        args.pretrained_model_path,
-        torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
-        use_safetensors=True,
-        device_map="auto",
-        attn_implementation="eager"
-    )
+    if is_llava:
+        model = LlavaForConditionalGeneration.from_pretrained(
+            args.pretrained_model_path,
+            torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+            use_safetensors=True,
+            device_map="auto",
+        )
+        try:
+            processor = AutoProcessor.from_pretrained(args.pretrained_model_path, use_fast=False)
+            toker = processor.tokenizer
+        except Exception:
+            toker = AutoTokenizer.from_pretrained(args.pretrained_model_path, use_fast=False)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.pretrained_model_path,
+            torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+            use_safetensors=True,
+            device_map="auto",
+            attn_implementation="eager"
+        )
+        toker = AutoTokenizer.from_pretrained(args.pretrained_model_path, use_fast='Orca-2-' not in model_name)
 
     logging.info(f"Model name: {model_name}")
     logging.info(f"Model size: {model.get_memory_footprint()/1e9}")
     logging_cuda_memory_usage()
 
-    # prepare toker
-    toker = AutoTokenizer.from_pretrained(args.pretrained_model_path, use_fast='Orca-2-' not in model_name)
-
-    if 'Llama-2-' in model_name and '-chat' in model_name:
-        generation_config_file = './generation_configs/llama-2-chat.json'
-    elif 'CodeLlama-' in model_name and '-Instruct' in model_name:
-        generation_config_file = './generation_configs/llama-2-chat.json'
-    elif 'Orca-2-' in model_name:
-        generation_config_file = './generation_configs/orca-2.json'
-    elif 'Mistral-' in model_name and '-Instruct' in model_name:
-        generation_config_file = './generation_configs/mistral-instruct.json'
-    elif 'vicuna-' in model_name:
-        generation_config_file = './generation_configs/vicuna.json'
-    elif 'openchat-' in model_name:
-        generation_config_file = './generation_configs/openchat.json'
-    else:
-        raise ValueError(f"Unsupported or untuned model: {model_name}")
-    generation_config = json.load(open(generation_config_file))
-    chat_template_file = generation_config['chat_template']
-    chat_template = open(chat_template_file).read()
-    chat_template = chat_template.replace('    ', '').replace('\n', '')
-    toker.chat_template = chat_template
+    if not is_llava:
+        if 'Llama-2-' in model_name and '-chat' in model_name:
+            generation_config_file = './generation_configs/llama-2-chat.json'
+        elif 'CodeLlama-' in model_name and '-Instruct' in model_name:
+            generation_config_file = './generation_configs/llama-2-chat.json'
+        elif 'Orca-2-' in model_name:
+            generation_config_file = './generation_configs/orca-2.json'
+        elif 'Mistral-' in model_name and '-Instruct' in model_name:
+            generation_config_file = './generation_configs/mistral-instruct.json'
+        elif 'vicuna-' in model_name:
+            generation_config_file = './generation_configs/vicuna.json'
+        elif 'openchat-' in model_name:
+            generation_config_file = './generation_configs/openchat.json'
+        else:
+            raise ValueError(f"Unsupported or untuned model: {model_name}")
+        generation_config = json.load(open(generation_config_file))
+        chat_template_file = generation_config['chat_template']
+        chat_template = open(chat_template_file).read()
+        chat_template = chat_template.replace('    ', '').replace('\n', '')
+        toker.chat_template = chat_template
 
     with safe_open(f'./trained_prompts/{model_name}/type.{args.system_prompt_type}_length.{args.prompt_length}.safetensors', framework='pt') as f:
         soft_prompt = f.get_tensor('soft_prompt')
     toker, new_input_embeddings = process_soft_prompt_as_word_embedding(model, toker, soft_prompt)
-    model.set_input_embeddings(new_input_embeddings.to(device=model.device, dtype=model.dtype))
+    target_device = model.get_input_embeddings().weight.device if is_llava else model.device
+    model.set_input_embeddings(new_input_embeddings.to(device=target_device, dtype=model.dtype))
 
     # prepare data
     if args.use_harmless or args.use_testset:
@@ -147,7 +172,7 @@ def main():
     tensors = {}
     for idx, messages in tqdm(enumerate(all_messages),
                               total=len(all_messages), dynamic_ncols=True):
-        hidden_states = forward(model, toker, messages)
+        hidden_states = forward(model, toker, messages, is_llava=is_llava)
         for i, hs in enumerate(hidden_states):
             tensors[f'sample.{idx}_layer.{i}'] = hs
     save_file(tensors, f'{args.output_path}/{model_name}_{dataset}.safetensors')
