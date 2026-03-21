@@ -1,5 +1,6 @@
-
+import json
 import os
+import re
 import torch
 import torch.nn as nn
 import pandas as pd
@@ -19,8 +20,61 @@ logging.basicConfig(
 PCA_DIM = 4
 
 
+def infer_mm_dataset_name(mm_jsonl_path: str) -> str:
+    stem = os.path.splitext(os.path.basename(mm_jsonl_path))[0]
+    if stem == "train_mm":
+        return "vlguard_train"
+    if stem == "test_mm":
+        return "vlguard_test"
+    stem = stem.replace("_mm", "")
+    stem = re.sub(r"[^A-Za-z0-9]+", "_", stem).strip("_")
+    if len(stem) == 0:
+        raise ValueError(f"Cannot infer dataset name from mm_jsonl: {mm_jsonl_path}")
+    return stem
+
+
+def load_mm_rows(
+    mm_jsonl_path: str,
+    label_filter: int | None = None,
+    require_label: bool = False,
+    require_existing_images: bool = True,
+):
+    rows = []
+    with open(mm_jsonl_path, "r", encoding="utf-8") as f:
+        for line_idx, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            if "question" not in row or "image_path" not in row:
+                continue
+            question = str(row["question"]).strip()
+            image_path = str(row["image_path"]).strip()
+            if len(question) == 0 or len(image_path) == 0:
+                continue
+            if require_existing_images and not os.path.exists(image_path):
+                raise ValueError(f"Missing image_path at line {line_idx}: {image_path}")
+            label = row.get("label")
+            if require_label and label is None:
+                raise ValueError(f"Missing label at line {line_idx} in {mm_jsonl_path}")
+            if label is not None:
+                label = int(label)
+                if label not in [0, 1]:
+                    raise ValueError(f"label must be 0/1 at line {line_idx}, got {row['label']}")
+            if label_filter is not None and label != label_filter:
+                continue
+            rows.append({
+                "question": question,
+                "image_path": image_path,
+                "label": label,
+            })
+    if len(rows) == 0:
+        raise ValueError(f"No valid rows found in {mm_jsonl_path}")
+    return rows
+
+
 def get_following_indices(
-    model_name, dataset='custom', config='sampling',
+    model_name, dataset, config='sampling',
     use_default_prompt=False, use_short_prompt=False, use_mistral_prompt=False,
     use_soft_prompt=False,
     use_harmless=False,

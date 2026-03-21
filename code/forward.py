@@ -3,13 +3,15 @@ import json
 import pandas as pd
 import numpy as np
 import argparse
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoProcessor, LlavaForConditionalGeneration
+from PIL import Image
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoProcessor, AutoImageProcessor, LlavaForConditionalGeneration, LlavaProcessor
 import torch
 import logging
 from tqdm import tqdm
 import warnings
 from utils import patch_open, logging_cuda_memory_usage
 from utils import DEFAULT_SYSTEM_PROMPT, SHORT_SYSTEM_PROMPT, MISTRAL_SYSTEM_PROMPT
+from utils import infer_mm_dataset_name, load_mm_rows
 from safetensors.torch import save_file
 import gc
 import random
@@ -38,26 +40,78 @@ def build_llava_prompt(messages):
     return f"USER: {merged_user}\nASSISTANT:"
 
 
-def forward(model, toker, messages, is_llava=False):
+def build_llava_text_inputs_for_messages(tokenizer, messages, device):
+    input_text = build_llava_prompt(messages)
+    tokenized = tokenizer(
+        input_text,
+        return_tensors="pt",
+        padding=True,
+    )
+    return tokenized["input_ids"].to(device), tokenized["attention_mask"].to(device)
+
+
+def encode_llava_visual_tokens(model: LlavaForConditionalGeneration, llava_processor, image_paths):
+    images = [Image.open(p).convert("RGB") for p in image_paths]
+    pixel_values = llava_processor.image_processor(images=images, return_tensors="pt")["pixel_values"]
+    vision_param = next(model.vision_tower.parameters())
+    llm_device = model.get_input_embeddings().weight.device
+    pixel_values = pixel_values.to(device=vision_param.device, dtype=vision_param.dtype)
+    with torch.no_grad():
+        image_outputs = model.vision_tower(pixel_values, output_hidden_states=True)
+        selected_image_feature = image_outputs.hidden_states[model.config.vision_feature_layer]
+        if model.config.vision_feature_select_strategy == "default":
+            selected_image_feature = selected_image_feature[:, 1:]
+        elif model.config.vision_feature_select_strategy != "full":
+            raise ValueError(f"Unexpected vision_feature_select_strategy: {model.config.vision_feature_select_strategy}")
+        image_features = model.multi_modal_projector(selected_image_feature)
+    return image_features.to(device=llm_device, dtype=model.dtype)
+
+
+def forward(model, toker, messages, is_llava=False, enable_vision=False, llava_processor=None, image_path=None):
     if is_llava:
-        input_text = build_llava_prompt(messages)
+        llm_device = model.get_input_embeddings().weight.device
+        input_ids, text_attention_mask = build_llava_text_inputs_for_messages(toker, messages, llm_device)
+        if enable_vision:
+            if image_path is None or llava_processor is None:
+                raise ValueError("LLaVA vision forward requires image_path and llava_processor")
+            visual_embeds = encode_llava_visual_tokens(model, llava_processor, [image_path])
+            text_embeds = model.get_input_embeddings()(input_ids)
+            prefix_mask = torch.ones(
+                visual_embeds.size(0),
+                visual_embeds.size(1),
+                dtype=text_attention_mask.dtype,
+                device=llm_device,
+            )
+            outputs = model(
+                inputs_embeds=torch.cat([visual_embeds, text_embeds], dim=1),
+                attention_mask=torch.cat([prefix_mask, text_attention_mask], dim=1),
+                return_dict=True,
+                output_hidden_states=True,
+            )
+        else:
+            outputs = model(
+                input_ids,
+                attention_mask=text_attention_mask,
+                return_dict=True,
+                output_hidden_states=True,
+            )
     else:
         input_text = toker.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
-    model_device = model.get_input_embeddings().weight.device if is_llava else model.device
-    input_ids = torch.tensor(
-        toker.convert_tokens_to_ids(toker.tokenize(input_text)),
-        dtype=torch.long,
-    ).unsqueeze(0).to(model_device)
+        model_device = model.device
+        input_ids = torch.tensor(
+            toker.convert_tokens_to_ids(toker.tokenize(input_text)),
+            dtype=torch.long,
+        ).unsqueeze(0).to(model_device)
 
-    outputs = model(
-        input_ids,
-        attention_mask=input_ids.new_ones(input_ids.size(), dtype=torch.long),
-        return_dict=True,
-        output_hidden_states=True,
-    )
-    hidden_states = [e[0].detach().half().cpu() for e in outputs.hidden_states[1:]]
-
-    return hidden_states
+        outputs = model(
+            input_ids,
+            attention_mask=input_ids.new_ones(input_ids.size(), dtype=torch.long),
+            return_dict=True,
+            output_hidden_states=True,
+        )
+    # We only keep the final token representation from the last decoder layer,
+    # which is the only hidden state consumed by estimate.py.
+    return outputs.hidden_states[-1][0, -1:].detach().half().cpu()
 
 
 def main():
@@ -65,17 +119,16 @@ def main():
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--pretrained_model_path", type=str, required=True)
-    parser.add_argument("--use_malicious", action="store_true")
-    parser.add_argument("--use_advbench", action="store_true")
     parser.add_argument("--use_harmless", action="store_true")
-    parser.add_argument("--use_testset", action="store_true")
+    parser.add_argument("--enable_vision", action="store_true")
+    parser.add_argument("--mm_jsonl", type=str, default=None)
     parser.add_argument("--output_path", type=str, default='./hidden_states')
     args = parser.parse_args()
 
-    if args.use_malicious and args.use_advbench:
-        raise ValueError("Only one of --use_malicious and --use_advbench can be set to True")
-    if (args.use_malicious or args.use_advbench) and args.use_harmless:
-        raise ValueError("Only one of --use_malicious/--use_advbench and --use_harmless can be set to True")
+    if args.mm_jsonl is None or not os.path.exists(args.mm_jsonl):
+        raise ValueError("--mm_jsonl must point to an existing multimodal jsonl file")
+    if not args.enable_vision:
+        raise ValueError("--mm_jsonl in forward.py requires --enable_vision so hidden states come from image+text")
 
     # prepare model
     model_name = args.model_name = args.pretrained_model_path.split('/')[-1]
@@ -90,9 +143,12 @@ def main():
         )
         try:
             processor = AutoProcessor.from_pretrained(args.pretrained_model_path, use_fast=False)
-            toker = processor.tokenizer
+            llava_processor = processor
         except Exception:
-            toker = AutoTokenizer.from_pretrained(args.pretrained_model_path, use_fast=False)
+            llava_image_processor = AutoImageProcessor.from_pretrained(args.pretrained_model_path)
+            llava_tokenizer = AutoTokenizer.from_pretrained(args.pretrained_model_path, use_fast=False)
+            llava_processor = LlavaProcessor(image_processor=llava_image_processor, tokenizer=llava_tokenizer)
+        toker = llava_processor.tokenizer
     else:
         model = AutoModelForCausalLM.from_pretrained(
             args.pretrained_model_path,
@@ -102,10 +158,18 @@ def main():
             attn_implementation="eager"
         )
         toker = AutoTokenizer.from_pretrained(args.pretrained_model_path, use_fast='Orca-2-' not in model_name)
+        llava_processor = None
 
     logging.info(f"Model name: {model_name}")
     logging.info(f"Model size: {model.get_memory_footprint()/1e9}")
     logging_cuda_memory_usage()
+
+    config = model.config
+    num_layers = getattr(config, "num_hidden_layers", None)
+    if num_layers is None and hasattr(config, "text_config"):
+        num_layers = getattr(config.text_config, "num_hidden_layers", None)
+    if num_layers is None:
+        raise ValueError("Cannot infer num_hidden_layers from model config")
 
     if not is_llava:
         if 'Llama-2-' in model_name and '-chat' in model_name:
@@ -129,32 +193,21 @@ def main():
         toker.chat_template = chat_template
 
     # prepare data
-    if args.use_harmless or args.use_testset:
-        data_path = './data_harmless'
+    all_image_paths = None
+    dataset = infer_mm_dataset_name(args.mm_jsonl)
+    mm_rows = load_mm_rows(
+        args.mm_jsonl,
+        label_filter=1 if args.use_harmless else 0,
+        require_label=True,
+        require_existing_images=True,
+    )
+    all_queries = [row["question"] for row in mm_rows]
+    all_image_paths = [row["image_path"] for row in mm_rows]
+    if args.use_harmless:
         args.output_path += "_harmless"
-    else:
-        data_path = './data'
-
-    if args.use_malicious:
-        dataset = "malicious"
-        with open(f"{data_path}/MaliciousInstruct.txt") as f:
-            lines = f.readlines()
-    elif args.use_advbench:
-        dataset = "advbench"
-        with open(f"{data_path}/advbench.txt") as f:
-            lines = f.readlines()[:100]
-    elif args.use_testset:
-        dataset = "testset"
-        with open(f"{data_path}/testset.txt") as f:
-            lines = f.readlines()
-    else:
-        dataset = "custom"
-        with open(f"{data_path}/custom.txt") as f:
-            lines = f.readlines()
     os.makedirs(f"{args.output_path}", exist_ok=True)
 
     # prepend sys prompt
-    all_queries = [e.strip() for e in lines]
     n_queries = len(all_queries)
 
     all_messages = [prepend_sys_prompt(l, args) for l in all_queries]
@@ -166,33 +219,65 @@ def main():
     tensors = {}
     for idx, messages in tqdm(enumerate(all_messages),
                               total=len(all_messages), dynamic_ncols=True):
-        hidden_states = forward(model, toker, messages, is_llava=is_llava)
-        for i, hs in enumerate(hidden_states):
-            tensors[f'sample.{idx}_layer.{i}'] = hs
+        image_path = all_image_paths[idx] if all_image_paths is not None else None
+        final_hidden_state = forward(
+            model,
+            toker,
+            messages,
+            is_llava=is_llava,
+            enable_vision=args.enable_vision,
+            llava_processor=llava_processor,
+            image_path=image_path,
+        )
+        tensors[f'sample.{idx}_layer.{num_layers-1}'] = final_hidden_state
     save_file(tensors, f'{args.output_path}/{model_name}_{dataset}.safetensors')
 
     tensors = {}
     for idx, messages_with_default in tqdm(enumerate(all_messages_with_default),
                                        total=len(all_messages_with_default), dynamic_ncols=True):
-        hidden_states = forward(model, toker, messages_with_default, is_llava=is_llava)
-        for i, hs in enumerate(hidden_states):
-            tensors[f'sample.{idx}_layer.{i}'] = hs
+        image_path = all_image_paths[idx] if all_image_paths is not None else None
+        final_hidden_state = forward(
+            model,
+            toker,
+            messages_with_default,
+            is_llava=is_llava,
+            enable_vision=args.enable_vision,
+            llava_processor=llava_processor,
+            image_path=image_path,
+        )
+        tensors[f'sample.{idx}_layer.{num_layers-1}'] = final_hidden_state
     save_file(tensors, f'{args.output_path}/{model_name}_with_default_{dataset}.safetensors')
 
     tensors = {}
     for idx, messages_with_short in tqdm(enumerate(all_messages_with_short),
                                        total=len(all_messages_with_short), dynamic_ncols=True):
-        hidden_states = forward(model, toker, messages_with_short, is_llava=is_llava)
-        for i, hs in enumerate(hidden_states):
-            tensors[f'sample.{idx}_layer.{i}'] = hs
+        image_path = all_image_paths[idx] if all_image_paths is not None else None
+        final_hidden_state = forward(
+            model,
+            toker,
+            messages_with_short,
+            is_llava=is_llava,
+            enable_vision=args.enable_vision,
+            llava_processor=llava_processor,
+            image_path=image_path,
+        )
+        tensors[f'sample.{idx}_layer.{num_layers-1}'] = final_hidden_state
     save_file(tensors, f'{args.output_path}/{model_name}_with_short_{dataset}.safetensors')
 
     tensors = {}
     for idx, messages_with_mistral in tqdm(enumerate(all_messages_with_mistral),
                                        total=len(all_messages_with_mistral), dynamic_ncols=True):
-        hidden_states = forward(model, toker, messages_with_mistral, is_llava=is_llava)
-        for i, hs in enumerate(hidden_states):
-            tensors[f'sample.{idx}_layer.{i}'] = hs
+        image_path = all_image_paths[idx] if all_image_paths is not None else None
+        final_hidden_state = forward(
+            model,
+            toker,
+            messages_with_mistral,
+            is_llava=is_llava,
+            enable_vision=args.enable_vision,
+            llava_processor=llava_processor,
+            image_path=image_path,
+        )
+        tensors[f'sample.{idx}_layer.{num_layers-1}'] = final_hidden_state
     save_file(tensors, f'{args.output_path}/{model_name}_with_mistral_{dataset}.safetensors')
 
     logging_cuda_memory_usage()

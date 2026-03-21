@@ -14,6 +14,7 @@ from scipy.stats import ttest_1samp
 import warnings
 from utils import patch_open, logging_cuda_memory_usage, get_following_indices
 from utils import PCA_DIM
+from utils import infer_mm_dataset_name, load_mm_rows
 from safetensors import safe_open
 import gc
 import random
@@ -59,6 +60,7 @@ def main():
     parser.add_argument("--config", type=str, choices=["greedy", "sampling"], required=True)
     parser.add_argument("--output_path", type=str, default='./estimations')
     parser.add_argument("--system_prompt_type", type=str, choices=['all'], required=True)
+    parser.add_argument("--mm_jsonl", type=str, default='./data/data_vlguard/processed/train_mm.jsonl')
     parser.add_argument("--n_splits", type=int, default=10)
     args = parser.parse_args()
 
@@ -67,20 +69,20 @@ def main():
         logging.info(f"{k}: {v}")
 
     # prepare data
-    dataset = 'custom'
-    with open(f"./data/{dataset}.txt") as f:
-        lines = f.readlines()
-    with open(f"./data_harmless/{dataset}.txt") as f:
-        lines_harmless = f.readlines()
+    if args.mm_jsonl is None or not os.path.exists(args.mm_jsonl):
+        raise ValueError("--mm_jsonl must point to an existing multimodal jsonl file for estimate.py")
 
-    all_queries = [e.strip() for e in lines if e.strip()]
+    dataset = infer_mm_dataset_name(args.mm_jsonl)
+    harmful_rows = load_mm_rows(args.mm_jsonl, label_filter=0, require_label=True, require_existing_images=True)
+    harmless_rows = load_mm_rows(args.mm_jsonl, label_filter=1, require_label=True, require_existing_images=True)
+    all_queries = [row["question"] for row in harmful_rows]
+    all_queries_harmless = [row["question"] for row in harmless_rows]
+    logging.info(f"Loaded multimodal train data from {args.mm_jsonl}")
+    logging.info(f"Resolved estimation dataset tag: {dataset}")
+
     n_queries = len(all_queries)
-
-    all_queries_harmless = [e.strip() for e in lines_harmless if e.strip()]
     n_queries_harmless = len(all_queries_harmless)
-
-    assert n_queries == n_queries_harmless, f"{n_queries} != {n_queries_harmless}"
-    assert n_queries % args.n_splits == 0, f"{n_queries} % {args.n_splits} != 0"
+    logging.info(f"Harmful queries: {n_queries}, harmless queries: {n_queries_harmless}")
 
     logging_cuda_memory_usage()
     torch.cuda.empty_cache()
@@ -157,21 +159,21 @@ def main():
     all_hidden_states_with_mistral_harmless = torch.stack(all_hidden_states_with_mistral_harmless)
 
     scores = get_following_indices(
-        model_name, config=args.config, use_harmless=False, return_only_scores=True)
+        model_name, dataset=dataset, config=args.config, use_harmless=False, return_only_scores=True)
     scores_harmless = get_following_indices(
-        model_name, config=args.config, use_harmless=True, return_only_scores=True)
+        model_name, dataset=dataset, config=args.config, use_harmless=True, return_only_scores=True)
     scores_with_default = get_following_indices(
-        model_name, config=args.config, use_default_prompt=True, use_harmless=False, return_only_scores=True)
+        model_name, dataset=dataset, config=args.config, use_default_prompt=True, use_harmless=False, return_only_scores=True)
     scores_with_default_harmless = get_following_indices(
-        model_name, config=args.config, use_default_prompt=True, use_harmless=True, return_only_scores=True)
+        model_name, dataset=dataset, config=args.config, use_default_prompt=True, use_harmless=True, return_only_scores=True)
     scores_with_short = get_following_indices(
-        model_name, config=args.config, use_short_prompt=True, use_harmless=False, return_only_scores=True)
+        model_name, dataset=dataset, config=args.config, use_short_prompt=True, use_harmless=False, return_only_scores=True)
     scores_with_short_harmless = get_following_indices(
-        model_name, config=args.config, use_short_prompt=True, use_harmless=True, return_only_scores=True)
+        model_name, dataset=dataset, config=args.config, use_short_prompt=True, use_harmless=True, return_only_scores=True)
     scores_with_mistral = get_following_indices(
-        model_name, config=args.config, use_mistral_prompt=True, use_harmless=False, return_only_scores=True)
+        model_name, dataset=dataset, config=args.config, use_mistral_prompt=True, use_harmless=False, return_only_scores=True)
     scores_with_mistral_harmless = get_following_indices(
-        model_name, config=args.config, use_mistral_prompt=True, use_harmless=True, return_only_scores=True)
+        model_name, dataset=dataset, config=args.config, use_mistral_prompt=True, use_harmless=True, return_only_scores=True)
 
 
     scores = torch.tensor(scores, device='cuda', dtype=torch.float)
@@ -182,6 +184,45 @@ def main():
     scores_with_short_harmless = torch.tensor(scores_with_short_harmless, device='cuda', dtype=torch.float)
     scores_with_mistral = torch.tensor(scores_with_mistral, device='cuda', dtype=torch.float)
     scores_with_mistral_harmless = torch.tensor(scores_with_mistral_harmless, device='cuda', dtype=torch.float)
+
+    hidden_state_groups = [
+        all_hidden_states,
+        all_hidden_states_with_default,
+        all_hidden_states_with_short,
+        all_hidden_states_with_mistral,
+        all_hidden_states_harmless,
+        all_hidden_states_with_default_harmless,
+        all_hidden_states_with_short_harmless,
+        all_hidden_states_with_mistral_harmless,
+    ]
+    score_groups = [
+        scores,
+        scores_with_default,
+        scores_with_short,
+        scores_with_mistral,
+        scores_harmless,
+        scores_with_default_harmless,
+        scores_with_short_harmless,
+        scores_with_mistral_harmless,
+    ]
+    harmful_group_count = sum(group.size(0) for group in hidden_state_groups[:4])
+    harmless_group_count = sum(group.size(0) for group in hidden_state_groups[4:])
+    total_sample_count = harmful_group_count + harmless_group_count
+
+    for group_name, states, score_tensor in zip([
+            "harmful/base",
+            "harmful/default",
+            "harmful/short",
+            "harmful/mistral",
+            "harmless/base",
+            "harmless/default",
+            "harmless/short",
+            "harmless/mistral",
+        ], hidden_state_groups, score_groups):
+        if states.size(0) != score_tensor.size(0):
+            raise ValueError(
+                f"Mismatched sample count for {group_name}: "
+                f"{states.size(0)} hidden states vs {score_tensor.size(0)} scores")
 
 
     hidden_states = torch.cat([
@@ -250,68 +291,43 @@ def main():
         return best_model_copy
 
 
-    total_indices = list(range(8*n_queries))
+    total_indices = list(range(total_sample_count))
     set_seed(42)
     random.shuffle(total_indices)
+    split_indices = [indices.tolist() for indices in np.array_split(total_indices, args.n_splits)]
+
+    train_hidden_states = torch.cat(hidden_state_groups, dim=0).float()
+    refusal_targets = torch.cat(score_groups, dim=0)
+    harmfulness_targets = torch.cat([
+        torch.zeros(harmful_group_count, device='cuda', dtype=torch.float),
+        torch.ones(harmless_group_count, device='cuda', dtype=torch.float),
+    ], dim=0)
 
     logging.info(f"Training refusal model")
     refusal_linear_weights = []
     refusal_linear_biases = []
     for split_idx in range(args.n_splits):
         if args.n_splits > 1:
-            test_indices = total_indices[split_idx * 8*n_queries//args.n_splits: (split_idx+1) * 8*n_queries//args.n_splits]
-            train_indices = total_indices[:split_idx * 8*n_queries//args.n_splits] + total_indices[(split_idx+1) * 8*n_queries//args.n_splits:]
+            test_indices = split_indices[split_idx]
+            train_indices = []
+            for other_split_idx, split in enumerate(split_indices):
+                if other_split_idx != split_idx:
+                    train_indices.extend(split)
         else:
             test_indices = None
             train_indices = total_indices
 
-        train_X = torch.cat([
-            all_hidden_states,
-            all_hidden_states_with_default,
-            all_hidden_states_with_short,
-            all_hidden_states_with_mistral,
-            all_hidden_states_harmless,
-            all_hidden_states_with_default_harmless,
-            all_hidden_states_with_short_harmless,
-            all_hidden_states_with_mistral_harmless,
-        ], dim=0).float()[train_indices]
+        train_X = train_hidden_states[train_indices]
         train_X = torch.matmul(train_X - mean, V)
 
-        train_Y = torch.cat([
-            scores,
-            scores_with_default,
-            scores_with_short,
-            scores_with_mistral,
-            scores_harmless,
-            scores_with_default_harmless,
-            scores_with_short_harmless,
-            scores_with_mistral_harmless,
-        ], dim=0)[train_indices]
+        train_Y = refusal_targets[train_indices]
         #train_Y = torch.tensor(kmeans_smoothing(train_X, train_Y), device=train_X.device, dtype=torch.float)
 
         if test_indices is not None:
-            test_X = torch.cat([
-                all_hidden_states,
-                all_hidden_states_with_default,
-                all_hidden_states_with_short,
-                all_hidden_states_with_mistral,
-                all_hidden_states_harmless,
-                all_hidden_states_with_default_harmless,
-                all_hidden_states_with_short_harmless,
-                all_hidden_states_with_mistral_harmless,
-            ], dim=0).float()[test_indices]
+            test_X = train_hidden_states[test_indices]
             test_X = torch.matmul(test_X - mean, V)
 
-            test_Y = torch.cat([
-                scores,
-                scores_with_default,
-                scores_with_short,
-                scores_with_mistral,
-                scores_harmless,
-                scores_with_default_harmless,
-                scores_with_short_harmless,
-                scores_with_mistral_harmless,
-            ], dim=0)[test_indices]
+            test_Y = refusal_targets[test_indices]
         else:
             test_X = None
             test_Y = None
@@ -327,40 +343,25 @@ def main():
     harmfulness_linear_biases = []
     for split_idx in range(args.n_splits):
         if args.n_splits > 1:
-            test_indices = total_indices[split_idx * 8*n_queries//args.n_splits: (split_idx+1) * 8*n_queries//args.n_splits]
-            train_indices = total_indices[:split_idx * 8*n_queries//args.n_splits] + total_indices[(split_idx+1) * 8*n_queries//args.n_splits:]
+            test_indices = split_indices[split_idx]
+            train_indices = []
+            for other_split_idx, split in enumerate(split_indices):
+                if other_split_idx != split_idx:
+                    train_indices.extend(split)
         else:
             test_indices = None
             train_indices = total_indices
 
-        train_X = torch.cat([
-            all_hidden_states,
-            all_hidden_states_with_default,
-            all_hidden_states_with_short,
-            all_hidden_states_with_mistral,
-            all_hidden_states_harmless,
-            all_hidden_states_with_default_harmless,
-            all_hidden_states_with_short_harmless,
-            all_hidden_states_with_mistral_harmless,
-        ], dim=0).float()[train_indices]
+        train_X = train_hidden_states[train_indices]
         train_X = torch.matmul(train_X - mean, V)
 
-        train_Y = torch.tensor([0 for _ in range(4*n_queries)] + [1 for _ in range(4*n_queries)], device=train_X.device, dtype=torch.float)[train_indices]
+        train_Y = harmfulness_targets[train_indices]
 
         if test_indices is not None:
-            test_X = torch.cat([
-                all_hidden_states,
-                all_hidden_states_with_default,
-                all_hidden_states_with_short,
-                all_hidden_states_with_mistral,
-                all_hidden_states_harmless,
-                all_hidden_states_with_default_harmless,
-                all_hidden_states_with_short_harmless,
-                all_hidden_states_with_mistral_harmless,
-            ], dim=0).float()[test_indices]
+            test_X = train_hidden_states[test_indices]
             test_X = torch.matmul(test_X - mean, V)
 
-            test_Y = torch.tensor([0 for _ in range(4*n_queries)] + [1 for _ in range(4*n_queries)], device=train_X.device, dtype=torch.float)[test_indices]
+            test_Y = harmfulness_targets[test_indices]
         else:
             test_X = None
             test_Y = None

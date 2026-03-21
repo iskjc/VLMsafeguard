@@ -9,6 +9,7 @@ import os
 import logging
 import warnings
 from utils import MATCH_STRINGS, patch_open, logging_cuda_memory_usage
+from utils import infer_mm_dataset_name, load_mm_rows
 from multiprocessing.pool import ThreadPool
 from functools import partial
 
@@ -77,9 +78,13 @@ def get_eval_scores(res, evaluator, toker):
 
 def pick_best_and_eval(res: pd.DataFrame, evaluator, toker, prompts, use_harmless):
     # for fair evaluation, we may select the top-10 long responses from multiple sampled ones
+    res = res.copy()
+    res["prompt"] = res["prompt"].fillna("").astype(str).str.strip()
+    res["output"] = res["output"].fillna("").astype(str)
+    prompts = [str(prompt).strip() for prompt in prompts]
     logging.info(f"Number of samples before filtering: {len(res)}")
     res['output_length'] = res['output'].apply(lambda x: len(str(x).split()))
-    res = res.groupby('prompt').apply(lambda x: x.nlargest(20, 'output_length')).reset_index(drop=True)
+    res = res.groupby('prompt', dropna=False).apply(lambda x: x.nlargest(20, 'output_length')).reset_index(drop=True)
     logging.info(f"Number of samples after filtering: {len(res)}")
     # 1 for non-refusal, 0 for refusal
     if use_harmless:
@@ -93,14 +98,26 @@ def pick_best_and_eval(res: pd.DataFrame, evaluator, toker, prompts, use_harmles
     all_prompts = []
     all_refusal_scores = []
     all_outputs = []
+    missing_prompts = []
     for prompt in prompts:
         res_prompt: pd.DataFrame = res[res["prompt"] == prompt]
+        if res_prompt.empty:
+            missing_prompts.append(prompt)
+            refusal_scores.append(np.nan)
+            outputs.append("")
+            continue
         selected_res = res_prompt.sort_values("refusal_score", ascending=use_harmless)
         refusal_scores.append(selected_res["refusal_score"].mean())
         outputs.append(selected_res["output"].values[0])
         all_prompts.extend(res_prompt['prompt'].tolist())
         all_refusal_scores.extend(selected_res["refusal_score"].tolist())
         all_outputs.extend(selected_res["output"].tolist())
+    if missing_prompts:
+        logging.warning(
+            "Missing generated outputs for %d prompts; examples: %s",
+            len(missing_prompts),
+            missing_prompts[:5],
+        )
     res_best = pd.DataFrame({"prompt": prompts, "output": outputs, "refusal_score": refusal_scores})
     res_all = pd.DataFrame({"prompt": all_prompts, "output": all_outputs, "refusal_score": all_refusal_scores})
     return res_best, res_all
@@ -112,26 +129,17 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_names", type=str, nargs="+", required=True)
     parser.add_argument("--config", type=str, choices=["greedy", "sampling"])
-    parser.add_argument("--use_malicious", action="store_true")
-    parser.add_argument("--use_advbench", action="store_true")
-    parser.add_argument("--use_gcg", action="store_true")
     parser.add_argument("--evaluator_path", type=str)
     parser.add_argument("--use_harmless", action="store_true")
-    parser.add_argument("--use_testset", action="store_true")
     parser.add_argument("--generation_output_path", type=str, default='./outputs')
     parser.add_argument("--output_path", type=str, default='./eval_results')
+    parser.add_argument("--mm_jsonl", type=str, default=None)
     args = parser.parse_args()
 
-    if sum([args.use_malicious, args.use_advbench]) > 1:
-        raise ValueError("Only one of --use_malicious and --use_advbench can be set to True")
-    if sum([args.use_malicious, args.use_advbench]) > 0 and args.use_harmless:
-        raise ValueError("Only one of --use_malicious/--use_advbench and --use_harmless can be set to True")
-    if sum([args.use_malicious, args.use_advbench]) > 0 and args.use_testset:
-        raise ValueError("Only one of --use_malicious/--use_advbench and --use_harmless can be set to True")
+    if args.mm_jsonl is None or not os.path.exists(args.mm_jsonl):
+        raise ValueError("--mm_jsonl must point to an existing multimodal jsonl file")
     if not args.use_harmless and args.evaluator_path is None:
         raise ValueError("Please specify --evaluator_path when not using --use_harmless")
-    if args.use_testset and not args.use_harmless:
-        raise ValueError("--use_testset must be used with --use_harmless")
 
     # logging args
     for k, v in vars(args).items():
@@ -156,42 +164,21 @@ def main():
 
         args.model_name = model_name.split('/')[-1]
         fname = args.model_name
-        if args.use_harmless:
-            data_path = './data_harmless'
-            generation_output_path = args.generation_output_path + "_harmless"
-            output_path = args.output_path + "_harmless"
-        else:
-            data_path = './data'
-            generation_output_path = args.generation_output_path
-            output_path = args.output_path
+        generation_output_path = args.generation_output_path
+        output_path = args.output_path + ("_harmless" if args.use_harmless else "")
 
         os.makedirs(f"{output_path}/{args.config}", exist_ok=True)
 
-        if args.use_malicious:
-            fname += "_malicious"
-            args.model_name += "_malicious"
-            with open(f"{data_path}/MaliciousInstruct.txt") as f:
-                prompts = f.readlines()
-        elif args.use_advbench:
-            fname += "_advbench"
-            args.model_name += "_advbench"
-            with open(f"{data_path}/advbench.txt") as f:
-                prompts = f.readlines()[:100]
-        elif args.use_gcg:
-            fname += "_gcg"
-            args.model_name += "_gcg"
-            with open(f"{data_path}/advbench.txt") as f: # use original queries
-                prompts = f.readlines()[:100]
-        elif args.use_testset:
-            fname += "_testset"
-            args.model_name += "_testset"
-            with open(f"{data_path}/testset.txt") as f:
-                prompts = f.readlines()
-        else:
-            fname += "_custom"
-            args.model_name += "_custom"
-            with open(f"{data_path}/custom.txt") as f:
-                prompts = f.readlines()
+        dataset = infer_mm_dataset_name(args.mm_jsonl)
+        fname += f"_{dataset}"
+        args.model_name += f"_{dataset}"
+        mm_rows = load_mm_rows(
+            args.mm_jsonl,
+            label_filter=1 if args.use_harmless else 0,
+            require_label=True,
+            require_existing_images=False,
+        )
+        prompts = [row["question"] for row in mm_rows]
         prompts = [p.strip() for p in prompts]
         logging.info(args.model_name)
 
@@ -207,7 +194,7 @@ def main():
         if not os.path.exists(res_file):
             logging.info(f"File {res_file} does not exist, skip")
             continue
-        res = pd.read_csv(res_file, lineterminator='\n')
+        res = pd.read_csv(res_file, lineterminator='\n', keep_default_na=False, na_filter=False)
         try:
             res_best, res_all = pick_best_and_eval(res, evaluator, toker, prompts, args.use_harmless)
         except Exception as e:

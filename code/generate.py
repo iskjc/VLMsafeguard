@@ -3,6 +3,8 @@ import json
 import pandas as pd
 import numpy as np
 import argparse
+import glob
+from PIL import Image
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
@@ -15,12 +17,13 @@ from transformers import (
 from transformers import PreTrainedModel, PreTrainedTokenizer, PreTrainedTokenizerFast
 import torch
 import torch.nn as nn
-from typing import Union
+from typing import Union, Optional
 import logging
 from tqdm import tqdm
 import warnings
 from utils import patch_open, logging_cuda_memory_usage
 from utils import DEFAULT_SYSTEM_PROMPT, SHORT_SYSTEM_PROMPT, MISTRAL_SYSTEM_PROMPT
+from utils import infer_mm_dataset_name, load_mm_rows
 import gc
 import random
 from multiprocessing.pool import ThreadPool
@@ -52,9 +55,9 @@ def load_checkpoint_state_dict(path):
     return ckpt["projector"] if isinstance(ckpt, dict) and "projector" in ckpt else ckpt
 
 
-def prepend_sys_prompt(sentence, args):
+def prepend_sys_prompt(sentence, args, is_llava: bool = False):
     messages = [{'role': 'user', 'content': sentence.strip()}]
-    if args.use_soft_prompt:
+    if args.use_soft_prompt and not is_llava:
         messages = [{'role': 'system', 'content': ''.join([f'<soft_prompt_{i}>' for i in range(args.soft_prompt.size(0))])}] + messages
     elif args.use_default_prompt:
         messages = [{'role': 'system', 'content': DEFAULT_SYSTEM_PROMPT}] + messages
@@ -90,9 +93,109 @@ def process_soft_prompt_as_word_embedding(
     return toker, new_input_embeddings
 
 
+def resolve_versioned_soft_prompt_file(prompt_dir: str, save_stem: str, version: Optional[str] = None) -> Optional[str]:
+    default_file = os.path.join(prompt_dir, f"{save_stem}.safetensors")
+    if version is not None:
+        return os.path.join(prompt_dir, f"{save_stem}__{version}.safetensors")
+    if os.path.exists(default_file):
+        return default_file
+
+    versioned_pattern = os.path.join(prompt_dir, f"{save_stem}__*.safetensors")
+    versioned_files = [path for path in glob.glob(versioned_pattern) if os.path.isfile(path)]
+    if len(versioned_files) == 0:
+        return None
+
+    versioned_files.sort(key=lambda path: (os.path.getmtime(path), path), reverse=True)
+    chosen_file = versioned_files[0]
+    logging.info(
+        "No exact soft prompt found at %s, using latest versioned file: %s",
+        default_file,
+        chosen_file,
+    )
+    return chosen_file
+
+
+def resolve_soft_prompt_file(args, model_name: str, is_llava: bool) -> str:
+    if args.soft_prompt_path is not None:
+        return args.soft_prompt_path
+    if args.do_data_ablation:
+        return f'./trained_prompts_ablation/{model_name}/type.{args.system_prompt_type}_length.{args.prompt_length}.safetensors'
+    if args.do_unlikelihood:
+        return f'./trained_prompts_unlikelihood/{model_name}/length.{args.prompt_length}.safetensors'
+    if args.ablate_norm:
+        return f'./trained_prompts/{model_name}/type.{args.system_prompt_type}_length.{args.prompt_length}_nonorm.safetensors'
+    if args.ablate_refu:
+        return f'./trained_prompts/{model_name}/type.{args.system_prompt_type}_length.{args.prompt_length}_norefu.safetensors'
+    if args.ablate_harm:
+        return f'./trained_prompts/{model_name}/type.{args.system_prompt_type}_length.{args.prompt_length}_noharm.safetensors'
+    save_stem = f'type.{args.system_prompt_type}_length.{args.prompt_length}'
+    if is_llava:
+        mm_file = resolve_versioned_soft_prompt_file(
+            prompt_dir=f'./trained_prompts_mm/{model_name}',
+            save_stem=save_stem,
+            version=args.soft_prompt_version,
+        )
+        if mm_file is not None:
+            return mm_file
+        if args.soft_prompt_version is not None:
+            return f'./trained_prompts_mm/{model_name}/{save_stem}__{args.soft_prompt_version}.safetensors'
+        default_file = resolve_versioned_soft_prompt_file(
+            prompt_dir=f'./trained_prompts/{model_name}',
+            save_stem=save_stem,
+        )
+        if default_file is not None:
+            return default_file
+        return f'./trained_prompts/{model_name}/{save_stem}.safetensors'
+    default_file = resolve_versioned_soft_prompt_file(
+        prompt_dir=f'./trained_prompts/{model_name}',
+        save_stem=save_stem,
+        version=args.soft_prompt_version,
+    )
+    if default_file is not None:
+        return default_file
+    if args.soft_prompt_version is not None:
+        return f'./trained_prompts/{model_name}/{save_stem}__{args.soft_prompt_version}.safetensors'
+    return f'./trained_prompts/{model_name}/{save_stem}.safetensors'
+
+
+def build_llava_prompt_text(messages):
+    system_text = "\n".join([m["content"] for m in messages if m["role"] == "system"]).strip()
+    user_text = "\n".join([m["content"] for m in messages if m["role"] == "user"]).strip()
+    merged_user = f"{system_text}\n\n{user_text}".strip() if len(system_text) > 0 else user_text
+    return f"USER: {merged_user}\nASSISTANT:"
+
+
+def build_llava_text_inputs_for_messages(tokenizer, messages, device):
+    input_text = build_llava_prompt_text(messages)
+    tokenized = tokenizer(
+        input_text,
+        return_tensors="pt",
+        padding=True,
+    )
+    return input_text, tokenized["input_ids"].to(device), tokenized["attention_mask"].to(device)
+
+
+def encode_llava_visual_tokens(model: LlavaForConditionalGeneration, llava_processor, image_paths):
+    images = [Image.open(p).convert("RGB") for p in image_paths]
+    pixel_values = llava_processor.image_processor(images=images, return_tensors="pt")["pixel_values"]
+    vision_param = next(model.vision_tower.parameters())
+    llm_device = model.get_input_embeddings().weight.device
+    pixel_values = pixel_values.to(device=vision_param.device, dtype=vision_param.dtype)
+    with torch.no_grad():
+        image_outputs = model.vision_tower(pixel_values, output_hidden_states=True)
+        selected_image_feature = image_outputs.hidden_states[model.config.vision_feature_layer]
+        if model.config.vision_feature_select_strategy == "default":
+            selected_image_feature = selected_image_feature[:, 1:]
+        elif model.config.vision_feature_select_strategy != "full":
+            raise ValueError(f"Unexpected vision_feature_select_strategy: {model.config.vision_feature_select_strategy}")
+        image_features = model.multi_modal_projector(selected_image_feature)
+    image_features = image_features.to(device=llm_device, dtype=model.dtype)
+    return image_features
+
+
 def generate(inputs, model, toker, max_new_tokens, n_samples, temp, top_p, stop_token_ids, stop_str,
              enable_vision=False,vl_adapter=None,image_processor=None,image_path=None,
-             is_llava=False,llava_processor=None):
+             is_llava=False,llava_processor=None,soft_prompt: Optional[torch.Tensor] = None):
     qdx, payload = inputs
     if len(payload) == 4:
         seed, query, messages, sample_image_path = payload
@@ -106,14 +209,11 @@ def generate(inputs, model, toker, max_new_tokens, n_samples, temp, top_p, stop_
         set_seed(seed)
 
     if is_llava:
-        # Keep this prompt format simple and robust for llava-1.5 checkpoints.
-        system_text = "\n".join([m["content"] for m in messages if m["role"] == "system"]).strip()
-        user_text = "\n".join([m["content"] for m in messages if m["role"] == "user"]).strip()
-        merged_user = f"{system_text}\n\n{user_text}".strip() if len(system_text) > 0 else user_text
+        merged_text_prompt = build_llava_prompt_text(messages)
         if enable_vision:
-            input_text = f"USER: <image>\n{merged_user}\nASSISTANT:"
+            input_text = merged_text_prompt.replace("USER: ", "USER: <image>\n", 1)
         else:
-            input_text = f"USER: {merged_user}\nASSISTANT:"
+            input_text = merged_text_prompt
     else:
         input_text = toker.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
 
@@ -127,13 +227,56 @@ def generate(inputs, model, toker, max_new_tokens, n_samples, temp, top_p, stop_
     if len(bad_words_ids) == 0:
         bad_words_ids = None
 
-    if is_llava:
+    if is_llava and soft_prompt is not None:
+        llm_device = model.get_input_embeddings().weight.device
+        llava_tokenizer = llava_processor.tokenizer if hasattr(llava_processor, "tokenizer") and llava_processor.tokenizer is not None else toker
+        _, text_input_ids, text_attention_mask = build_llava_text_inputs_for_messages(
+            tokenizer=llava_tokenizer,
+            messages=messages,
+            device=llm_device,
+        )
+        text_embeds = model.get_input_embeddings()(text_input_ids)
+        bsz = text_embeds.size(0)
+        soft_batch = soft_prompt.to(device=llm_device, dtype=model.dtype).unsqueeze(0).repeat(bsz, 1, 1)
+
+        if enable_vision:
+            actual_image_path = sample_image_path if sample_image_path is not None else image_path
+            if actual_image_path is None:
+                raise ValueError("LLaVA with --enable_vision requires --image_path or --mm_jsonl with image_path")
+            visual_embeds = encode_llava_visual_tokens(model, llava_processor, [actual_image_path])
+            n_vis = visual_embeds.size(1)
+            n_prompt = soft_batch.size(1)
+            prefix_mask = torch.ones(bsz, n_vis + n_prompt, dtype=text_attention_mask.dtype, device=llm_device)
+            inputs_embeds = torch.cat([visual_embeds, soft_batch, text_embeds], dim=1)
+            attention_mask = torch.cat([prefix_mask, text_attention_mask], dim=1)
+        else:
+            n_prompt = soft_batch.size(1)
+            prefix_mask = torch.ones(bsz, n_prompt, dtype=text_attention_mask.dtype, device=llm_device)
+            inputs_embeds = torch.cat([soft_batch, text_embeds], dim=1)
+            attention_mask = torch.cat([prefix_mask, text_attention_mask], dim=1)
+
+        prompt_len = inputs_embeds.size(1)
+        llava_lm = model.language_model
+        generations = llava_lm.generate(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            min_new_tokens=1,
+            max_new_tokens=max_new_tokens,
+            do_sample=True if temp > 0 else False,
+            temperature=temp if temp > 0 else 1.0,
+            top_p=top_p,
+            top_k=50,
+            num_return_sequences=n_samples,
+            eos_token_id=stop_token_ids,
+            pad_token_id=toker.eos_token_id,
+            return_dict_in_generate=True,
+        )
+    elif is_llava:
         llava_device = next(model.parameters()).device
         if enable_vision:
             actual_image_path = sample_image_path if sample_image_path is not None else image_path
             if actual_image_path is None:
                 raise ValueError("LLaVA with --enable_vision requires --image_path or --mm_jsonl with image_path")
-            from PIL import Image
             pil_image = Image.open(actual_image_path).convert("RGB")
             model_inputs = llava_processor(images=pil_image, text=input_text, return_tensors="pt")
         else:
@@ -154,7 +297,7 @@ def generate(inputs, model, toker, max_new_tokens, n_samples, temp, top_p, stop_
         prompt_len = model_inputs["input_ids"].size(1)
         generations = model.generate(
             **model_inputs,
-            min_new_tokens=10,
+            min_new_tokens=1,
             max_new_tokens=max_new_tokens,
             do_sample=True if temp > 0 else False,
             temperature=temp if temp > 0 else 1.0,
@@ -181,7 +324,7 @@ def generate(inputs, model, toker, max_new_tokens, n_samples, temp, top_p, stop_
         generations = model.generate(
             inputs_embeds=mm_inputs.inputs_embeds,
             attention_mask=mm_inputs.attention_mask,
-            min_new_tokens=10,
+            min_new_tokens=1,
             max_new_tokens=max_new_tokens,
             do_sample=True if temp > 0 else False,
             temperature=temp if temp > 0 else 1.0,
@@ -203,7 +346,7 @@ def generate(inputs, model, toker, max_new_tokens, n_samples, temp, top_p, stop_
         generations = model.generate(
             input_ids,
             attention_mask=input_ids.new_ones(input_ids.size(), dtype=torch.long),
-            min_new_tokens=10,
+            min_new_tokens=1,
             max_new_tokens=max_new_tokens,
             do_sample=True if temp > 0 else False,
             temperature=temp if temp > 0 else 1.0,
@@ -260,6 +403,7 @@ def main():
     parser.add_argument("--pretrained_model_path", type=str, required=True)
     parser.add_argument("--n_samples", type=int, default=1)
     parser.add_argument("--use_sampling", action="store_true")
+    parser.add_argument("--seed_base", type=int, default=None)
 
     parser.add_argument("--use_soft_prompt", action="store_true")
     parser.add_argument("--prompt_length", type=str, choices=['default', 'mistral', 'short'])
@@ -269,17 +413,13 @@ def main():
     parser.add_argument("--ablate_norm", action="store_true")
     parser.add_argument("--ablate_refu", action="store_true")
     parser.add_argument("--ablate_harm", action="store_true")
+    parser.add_argument("--soft_prompt_path", type=str, default=None)
+    parser.add_argument("--soft_prompt_version", type=str, default=None)
 
     parser.add_argument("--use_default_prompt", action='store_true')
     parser.add_argument("--use_short_prompt", action='store_true')
     parser.add_argument("--use_mistral_prompt", action='store_true')
 
-    parser.add_argument("--use_malicious", action="store_true")
-    parser.add_argument("--use_advbench", action="store_true")
-    parser.add_argument("--use_alpaca", action="store_true")
-    parser.add_argument("--use_gcg", action="store_true")
-    parser.add_argument("--use_harmless", action="store_true")
-    parser.add_argument("--use_testset", action="store_true")
     parser.add_argument("--enable_vision", action="store_true")
     parser.add_argument("--vision_model_path", type=str, default=None)
     parser.add_argument("--vision_projector_type", type=str, choices=["linear", "mlp2x_gelu"], default="linear")
@@ -287,6 +427,7 @@ def main():
     parser.add_argument("--image_path", type=str, default=None)
     parser.add_argument("--output_path", type=str, default='./outputs')
     parser.add_argument("--mm_jsonl", type=str, default=None)
+    parser.add_argument("--max_new_tokens", type=int, default=None)
 
     args = parser.parse_args()
 
@@ -296,16 +437,12 @@ def main():
         raise ValueError("Only one of --use_soft_prompt, --use_default_prompt, --use_short/--use_mistral_prompt can be set to True")
     if not args.use_sampling and args.n_samples > 1:
         raise ValueError("n_samples must be 1 in greedy decoding")
-    if sum([args.use_malicious, args.use_advbench, args.use_alpaca]) > 1:
-        raise ValueError("Only one of --use_malicious/--use_advbench/--use_alpaca can be set to True")
-    if any([args.use_malicious, args.use_advbench, args.use_alpaca]) and args.use_harmless:
-        raise ValueError("Only one of --use_malicious/--use_advbench/--use_alpaca and --use_harmless can be set to True")
-    if any([args.use_malicious, args.use_advbench, args.use_alpaca]) and args.use_testset:
-        raise ValueError("Only one of --use_malicious/--use_advbench/--use_alpaca and --use_testset can be set to True")
-    if args.use_testset and not args.use_harmless:
-        raise ValueError("--use_testset must be used with --use_harmless")
     if args.use_soft_prompt and (args.prompt_length is None or args.system_prompt_type is None):
         raise ValueError("--use_soft_prompt requires both --prompt_length and --system_prompt_type")
+    if args.mm_jsonl is None or not os.path.exists(args.mm_jsonl):
+        raise ValueError("--mm_jsonl must point to an existing multimodal jsonl file")
+    if not args.enable_vision:
+        raise ValueError("generate.py now only supports multimodal generation and requires --enable_vision")
 
     # prepare toker
     model_name = args.model_name = args.pretrained_model_path.split('/')[-1]
@@ -363,43 +500,8 @@ def main():
     elif args.use_mistral_prompt:
         fname += "_with_mistral"
 
-    if args.use_harmless:
-        data_path = './data_harmless'
-        args.output_path += "_harmless"
-    elif args.use_alpaca:
-        data_path = './data_alpaca'
-        args.output_path += "_alpaca"
-    else:
-        data_path = './data'
-
-    if args.use_advbench:
-        fname += "_advbench"
-        with open(f"{data_path}/advbench.txt") as f:
-            lines = f.readlines()[:100]
-    elif args.use_malicious:
-        fname += "_malicious"
-        with open(f"{data_path}/MaliciousInstruct.txt") as f:
-            lines = f.readlines()
-    elif args.use_gcg:
-        fname += "_gcg"
-        with open(f"{data_path}/advbench.txt") as f:
-            lines = f.readlines()[:100]
-        templates = json.load(open(f'{data_path}/gcg.json'))
-        for i in range(len(lines)):
-            template = templates[str(i)]['final_suffix']
-            lines[i] = lines[i] + template
-    elif args.use_testset:
-        fname += "_testset"
-        with open(f"{data_path}/testset.txt") as f:
-            lines = f.readlines()
-    elif args.use_alpaca:
-        fname += "_alpaca"
-        with open(f"{data_path}/alpaca_eval.json") as f:
-            lines = [e['instruction'] for e in json.load(f)[:100]]
-    else:
-        fname += "_custom"
-        with open(f"{data_path}/custom.txt") as f:
-            lines = f.readlines()
+    dataset = infer_mm_dataset_name(args.mm_jsonl)
+    fname += f"_{dataset}"
     os.makedirs(f"{args.output_path}/{fname}", exist_ok=True)
 
     # logging args
@@ -412,13 +514,18 @@ def main():
         return
 
     # prepare model
-    model_dtype = (
-        torch.bfloat16 if torch.cuda.is_bf16_supported()
-        and not ((('Orca-2-' in model_name and args.use_soft_prompt)
-                  or ('vicuna-' in model_name and not args.use_soft_prompt)
-                  ) and args.use_testset)
-        else torch.float32
+    prefer_bf16 = (
+        torch.cuda.is_available()
+        and torch.cuda.is_bf16_supported()
+        and not (('Orca-2-' in model_name and args.use_soft_prompt)
+                 or ('vicuna-' in model_name and not args.use_soft_prompt))
     )
+    if prefer_bf16:
+        model_dtype = torch.bfloat16
+    elif torch.cuda.is_available():
+        model_dtype = torch.float16
+    else:
+        model_dtype = torch.float32
     if is_llava:
         model = LlavaForConditionalGeneration.from_pretrained(
             args.pretrained_model_path,
@@ -454,29 +561,21 @@ def main():
         llava_processor = None
 
     logging.info(f"Model name: {model_name}")
+    logging.info(f"Model dtype: {model_dtype}")
     logging.info(f"Model size: {model.get_memory_footprint()/1e9}")
     logging_cuda_memory_usage()
 
     if args.use_soft_prompt:
-        if is_llava:
-            raise ValueError("--use_soft_prompt is not supported with LLaVA models in this script")
-        if args.do_data_ablation:
-            soft_prompt_file = f'./trained_prompts_ablation/{model_name}/type.{args.system_prompt_type}_length.{args.prompt_length}.safetensors'
-        elif args.do_unlikelihood:
-            soft_prompt_file = f'./trained_prompts_unlikelihood/{model_name}/length.{args.prompt_length}.safetensors'
-        elif args.ablate_norm:
-            soft_prompt_file = f'./trained_prompts/{model_name}/type.{args.system_prompt_type}_length.{args.prompt_length}_nonorm.safetensors'
-        elif args.ablate_refu:
-            soft_prompt_file = f'./trained_prompts/{model_name}/type.{args.system_prompt_type}_length.{args.prompt_length}_norefu.safetensors'
-        elif args.ablate_harm:
-            soft_prompt_file = f'./trained_prompts/{model_name}/type.{args.system_prompt_type}_length.{args.prompt_length}_noharm.safetensors'
-        else:
-            soft_prompt_file = f'./trained_prompts/{model_name}/type.{args.system_prompt_type}_length.{args.prompt_length}.safetensors'
+        soft_prompt_file = resolve_soft_prompt_file(args, model_name=model_name, is_llava=is_llava)
+        if not os.path.exists(soft_prompt_file):
+            raise ValueError(f"soft prompt file not found: {soft_prompt_file}")
         with safe_open(soft_prompt_file, framework='pt') as f:
             soft_prompt = f.get_tensor('soft_prompt')
+        logging.info(f"Loaded soft prompt: {soft_prompt_file}")
         args.soft_prompt = soft_prompt
-        toker, new_input_embeddings = process_soft_prompt_as_word_embedding(model, toker, soft_prompt)
-        model.set_input_embeddings(new_input_embeddings.to(device=model.device, dtype=model.dtype))
+        if not is_llava:
+            toker, new_input_embeddings = process_soft_prompt_as_word_embedding(model, toker, soft_prompt)
+            model.set_input_embeddings(new_input_embeddings.to(device=model.device, dtype=model.dtype))
 
 
     #增加视觉模块
@@ -502,44 +601,16 @@ def main():
         vl_adapter.eval()
 
     # prepend sys prompt
-    all_image_paths = None
-    if args.mm_jsonl is not None:
-        mm_rows = []
-        skipped_missing_images = 0
-        with open(args.mm_jsonl, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                row = json.loads(line)
-                if "image_path" not in row or "question" not in row:
-                    continue
-                question = str(row["question"]).strip()
-                if len(question) == 0:
-                    continue
-                if args.enable_vision and not os.path.exists(row["image_path"]):
-                    skipped_missing_images += 1
-                    continue
-                mm_rows.append({"question": question, "image_path": row["image_path"]})
+    mm_rows = load_mm_rows(
+        args.mm_jsonl,
+        label_filter=None,
+        require_label=False,
+        require_existing_images=True,
+    )
+    all_queries = [e["question"] for e in mm_rows]
+    all_image_paths = [e["image_path"] for e in mm_rows]
 
-        if len(mm_rows) == 0:
-            raise ValueError(f"No valid rows with question/image_path found in {args.mm_jsonl}")
-        if skipped_missing_images > 0:
-            logging.warning(f"Skipped {skipped_missing_images} rows with missing image files in {args.mm_jsonl}")
-
-        all_queries = [e["question"] for e in mm_rows]
-        all_image_paths = [e["image_path"] for e in mm_rows]
-    else:
-        all_queries = [l.strip() for l in lines]
-
-    all_messages = [prepend_sys_prompt(l, args) for l in all_queries]
-
-    if args.use_gcg:
-        with open(f"{data_path}/advbench.txt") as f:
-            lines = f.readlines()[:100]
-        all_image_paths = None
-        all_queries = [l.strip() for l in lines]
-        all_messages = [prepend_sys_prompt(l, args) for l in all_queries]
+    all_messages = [prepend_sys_prompt(l, args, is_llava=is_llava) for l in all_queries]
 
     logging.info(f"Running")
     prompts = []
@@ -547,10 +618,10 @@ def main():
     outputs = []
     model.eval()
 
-    if args.use_harmless:
-        max_new_tokens = 200
-    elif args.use_alpaca:
-        max_new_tokens = 1000
+    if args.max_new_tokens is not None:
+        if args.max_new_tokens <= 0:
+            raise ValueError("--max_new_tokens must be positive")
+        max_new_tokens = args.max_new_tokens
     else:
         max_new_tokens = 300
 
@@ -568,6 +639,7 @@ def main():
             image_path=args.image_path,
             is_llava=is_llava,
             llava_processor=llava_processor,
+            soft_prompt=args.soft_prompt if args.use_soft_prompt else None,
         )
     else:
         generate_fn = partial(
@@ -583,11 +655,15 @@ def main():
             image_path=args.image_path,
             is_llava=is_llava,
             llava_processor=llava_processor,
+            soft_prompt=args.soft_prompt if args.use_soft_prompt else None,
         )
 
     pool = ThreadPool(1)
 
-    seeds = [None] * len(all_queries) # by default, we use qdx
+    if args.seed_base is None:
+        seeds = [None] * len(all_queries)  # by default, we use qdx
+    else:
+        seeds = [args.seed_base + i for i in range(len(all_queries))]
     pbar = tqdm(total=len(all_queries), dynamic_ncols=True)
     
     if all_image_paths is not None:

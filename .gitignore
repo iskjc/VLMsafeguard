@@ -3,3 +3,11 @@ outputs/*
 *.csv
 *.pyc
 *.safetensors
+*.txt
+data/*
+*.log
+summary.json
+train_mm.jsonl
+test_mm.jsonl
+code/eval_results/*
+code/eval_results_harmless/*

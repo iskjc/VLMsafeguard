@@ -1,6 +1,7 @@
 import os
 import json
 import argparse
+import math
 from typing import Union, Dict, List
 from PIL import Image
 from transformers import (
@@ -37,8 +38,8 @@ logging.basicConfig(
 )
 warnings.simplefilter("ignore")
 
-BATCH_SIZE = 50
-NUM_EPOCHES = 40
+DEFAULT_BATCH_SIZE = 50
+DEFAULT_NUM_EPOCHS = 40
 
 
 def embed_soft_prompt(
@@ -274,14 +275,20 @@ def embed_llava_base_inputs(
     return inputs_embeds, attention_mask, last_token_indices
 
 
-def get_shuffled_messages_and_labels(all_messages: List[Dict], labels: torch.Tensor, seed=42):
+def get_shuffled_messages_and_labels(
+    all_messages: List[Dict],
+    labels: torch.Tensor,
+    batch_size: int,
+    num_epochs: int,
+    seed: int = 42,
+):
     rng = random.Random(seed)
     assert len(all_messages) == len(labels)
     indices = list(range(len(all_messages)))
-    for epoch_idx in range(NUM_EPOCHES):
+    for epoch_idx in range(num_epochs):
         rng.shuffle(indices)
-        for start in range(0, len(all_messages), BATCH_SIZE):
-            end = min(start + BATCH_SIZE, len(all_messages))
+        for start in range(0, len(all_messages), batch_size):
+            end = min(start + batch_size, len(all_messages))
             batch_idx = indices[start:end]
             yield epoch_idx, [all_messages[i] for i in batch_idx], labels[batch_idx]
 
@@ -303,22 +310,51 @@ def main():
     parser.add_argument("--vision_projector_type", type=str, choices=["linear", "mlp2x_gelu"], default="linear")
     parser.add_argument("--projector_path", type=str, default=None)
     parser.add_argument("--mm_jsonl", type=str, default=None)
+    parser.add_argument("--batch_size", type=int, default=None)
+    parser.add_argument("--effective_batch_size", type=int, default=16)
+    parser.add_argument("--num_epochs", type=int, default=DEFAULT_NUM_EPOCHS)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--run_name_suffix", type=str, default=None)
     args = parser.parse_args()
     model_name = args.pretrained_model_path.split('/')[-1]
     is_llava = 'llava' in model_name.lower()
 
     if sum([args.ablate_norm, args.ablate_refu, args.ablate_harm]) >= 2:
         raise ValueError("Only one of --ablate_norm, --ablate_refu, --ablate_harm can be set to True")
-    if args.enable_vision and args.mm_jsonl is None:
-        raise ValueError("--enable_vision requires --mm_jsonl")
+    if not args.enable_vision:
+        raise ValueError("train.py now only supports multimodal training and requires --enable_vision")
+    if args.mm_jsonl is None or not os.path.exists(args.mm_jsonl):
+        raise ValueError("--mm_jsonl must point to an existing multimodal jsonl file")
     if args.enable_vision and (not is_llava) and args.vision_model_path is None:
         raise ValueError("--enable_vision requires --vision_model_path")
     if is_llava and not args.enable_vision:
         raise ValueError("LLaVA training in this script requires --enable_vision")
+    if args.batch_size is not None and args.batch_size <= 0:
+        raise ValueError("--batch_size must be positive")
+    if args.effective_batch_size <= 0:
+        raise ValueError("--effective_batch_size must be positive")
+    if args.num_epochs <= 0:
+        raise ValueError("--num_epochs must be positive")
+    if args.lr <= 0:
+        raise ValueError("--lr must be positive")
 
     # logging args
     for k, v in vars(args).items():
         logging.info(f"{k}: {v}")
+
+    # Vision training has much longer sequences and activation memory.
+    batch_size = args.batch_size if args.batch_size is not None else 4
+    target_effective_batch_size = max(batch_size, args.effective_batch_size)
+    num_epochs = args.num_epochs
+    logging.info(f"micro_batch_size: {batch_size}")
+    if target_effective_batch_size != args.effective_batch_size:
+        logging.info(
+            f"Requested effective_batch_size {args.effective_batch_size} is smaller than micro batch_size {batch_size}; "
+            f"using {target_effective_batch_size} instead."
+        )
+    logging.info(f"effective_batch_size: {target_effective_batch_size}")
+    logging.info(f"gradient_accumulation_steps: {math.ceil(target_effective_batch_size / batch_size)}")
+    logging.info(f"effective_num_epochs: {num_epochs}")
 
     # prepare model
     model_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
@@ -361,7 +397,8 @@ def main():
     logging.info(f"Model size: {model.get_memory_footprint()/1e9}")
     logging_cuda_memory_usage()
 
-    os.makedirs(f'{args.output_path}/{model_name}', exist_ok=True)
+    model_output_dir = f'{args.output_path}/{model_name}'
+    os.makedirs(model_output_dir, exist_ok=True)
 
     # prepare LinearTransform
     refusal_model = nn.Linear(PCA_DIM, 1)
@@ -440,36 +477,13 @@ def main():
     logging_cuda_memory_usage()
 
     # prepare data
-    if args.enable_vision:
-        raw_mm_samples = load_mm_samples(args.mm_jsonl)
-        all_samples = [{
-            "sample_id": f"mm_{idx}",
-            "question": e["question"],
-            "image_path": e["image_path"],
-            "label": int(e["label"]),
-        } for idx, e in enumerate(raw_mm_samples)]
-    else:
-        dataset = 'custom'
-        with open(f"./data/{dataset}.txt") as f:
-            lines = f.readlines()
-        with open(f"./data_harmless/{dataset}.txt") as f:
-            lines_harmless = f.readlines()
-
-        all_queries = [e.strip() for e in lines if e.strip()]
-        all_queries_harmless = [e.strip() for e in lines_harmless if e.strip()]
-        all_samples = []
-        for idx, q in enumerate(all_queries):
-            all_samples.append({
-                "sample_id": f"text_unsafe_{idx}",
-                "messages": [{'role': 'user', 'content': q}],
-                "label": 0,
-            })
-        for idx, q in enumerate(all_queries_harmless):
-            all_samples.append({
-                "sample_id": f"text_safe_{idx}",
-                "messages": [{'role': 'user', 'content': q}],
-                "label": 1,
-            })
+    raw_mm_samples = load_mm_samples(args.mm_jsonl)
+    all_samples = [{
+        "sample_id": f"mm_{idx}",
+        "question": e["question"],
+        "image_path": e["image_path"],
+        "label": int(e["label"]),
+    } for idx, e in enumerate(raw_mm_samples)]
 
     labels = torch.tensor([e["label"] for e in all_samples], dtype=torch.float).to(device)
 
@@ -484,11 +498,17 @@ def main():
                 llava_processor=llava_processor,
                 batch_samples=[sample],
             )
-            last_hidden_state = model.language_model(
+            llava_backbone = model.language_model.model if hasattr(model.language_model, "model") else model.language_model
+            llava_outputs = llava_backbone(
                 inputs_embeds=base_inputs_embeds,
                 attention_mask=base_attention_mask,
-                output_hidden_states=True,
-            ).hidden_states[-1][0, base_last_indices[0]].unsqueeze(0)
+                use_cache=False,
+                output_hidden_states=False,
+                return_dict=True,
+            )
+            if not hasattr(llava_outputs, "last_hidden_state"):
+                raise ValueError("LLaVA backbone output does not contain last_hidden_state")
+            last_hidden_state = llava_outputs.last_hidden_state[0, base_last_indices[0]].unsqueeze(0)
         elif args.enable_vision:
             base_inputs_embeds, base_attention_mask, base_last_indices = embed_mm_base_inputs(
                 model=model,
@@ -497,11 +517,22 @@ def main():
                 image_processor=image_processor,
                 batch_samples=[sample],
             )
-            last_hidden_state = model(
-                inputs_embeds=base_inputs_embeds,
-                attention_mask=base_attention_mask,
-                output_hidden_states=True,
-            ).hidden_states[-1][0, base_last_indices[0]].unsqueeze(0)
+            if hasattr(model, "model"):
+                last_hidden_state = model.model(
+                    inputs_embeds=base_inputs_embeds,
+                    attention_mask=base_attention_mask,
+                    use_cache=False,
+                    output_hidden_states=False,
+                    return_dict=True,
+                ).last_hidden_state[0, base_last_indices[0]].unsqueeze(0)
+            else:
+                last_hidden_state = model(
+                    inputs_embeds=base_inputs_embeds,
+                    attention_mask=base_attention_mask,
+                    use_cache=False,
+                    output_hidden_states=True,
+                    return_dict=True,
+                ).hidden_states[-1][0, base_last_indices[0]].unsqueeze(0)
         else:
             messages = sample["messages"]
             if args.prompt_length == 'default':
@@ -512,7 +543,20 @@ def main():
                 messages = [{'role': 'system', 'content': MISTRAL_SYSTEM_PROMPT}] + messages
             input_ids = toker.apply_chat_template(messages, add_generation_prompt=True, tokenize=True)
             input_ids = torch.tensor([input_ids], dtype=torch.long, device=model.device)
-            last_hidden_state = model(input_ids, output_hidden_states=True).hidden_states[-1][:, -1]
+            if hasattr(model, "model"):
+                last_hidden_state = model.model(
+                    input_ids=input_ids,
+                    use_cache=False,
+                    output_hidden_states=False,
+                    return_dict=True,
+                ).last_hidden_state[:, -1]
+            else:
+                last_hidden_state = model(
+                    input_ids=input_ids,
+                    use_cache=False,
+                    output_hidden_states=True,
+                    return_dict=True,
+                ).hidden_states[-1][:, -1]
 
         transformed = torch.matmul(last_hidden_state.float() - mean, V)
         refusal_logits = refusal_model(transformed[:, :PCA_DIM]).squeeze(-1)
@@ -521,14 +565,35 @@ def main():
         base_refusal_logits[sample_id] = refusal_logits.detach()
         base_harmfulness_logits[sample_id] = harmfulness_logits.detach()
 
+    suffix = None
+    if args.run_name_suffix is not None:
+        suffix = args.run_name_suffix.strip()
+        if len(suffix) == 0:
+            suffix = None
+        else:
+            suffix = suffix.replace("/", "_").replace(" ", "_")
+
     step = 0
-    optimizer = torch.optim.AdamW([soft_prompt], lr=1e-3)
+    optimizer = torch.optim.AdamW([soft_prompt], lr=args.lr)
     seed = 42
-    for epoch_idx, batch_samples, batch_labels in get_shuffled_messages_and_labels(all_samples, labels, seed=seed):
+    batches_per_epoch = math.ceil(len(all_samples) / batch_size)
+    accumulated_samples = 0
+    accumulated_total_loss = 0.0
+    accumulated_refusal_loss = 0.0
+    accumulated_harmfulness_loss = 0.0
+    accumulated_norm_loss = 0.0
+    optimizer.zero_grad(set_to_none=True)
+    for micro_step_idx, (epoch_idx, batch_samples, batch_labels) in enumerate(get_shuffled_messages_and_labels(
+        all_samples,
+        labels,
+        batch_size=batch_size,
+        num_epochs=num_epochs,
+        seed=seed,
+    ), start=1):
         batch_ids = [e["sample_id"] for e in batch_samples]
+        batch_sample_count = len(batch_samples)
         batch_base_refusal_logits = torch.concat([base_refusal_logits[e] for e in batch_ids], dim=0)
         batch_base_harmfulness_logits = torch.concat([base_harmfulness_logits[e] for e in batch_ids], dim=0)
-        optimizer.zero_grad()
 
         if is_llava and args.enable_vision:
             inputs_embeds, attention_mask, last_token_indices = embed_llava_soft_prompt(
@@ -537,11 +602,17 @@ def main():
                 batch_samples=batch_samples,
                 soft_prompt=soft_prompt,
             )
-            new_hidden_states = model.language_model(
+            llava_backbone = model.language_model.model if hasattr(model.language_model, "model") else model.language_model
+            llava_outputs = llava_backbone(
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
-                output_hidden_states=True,
-            ).hidden_states[-1]
+                use_cache=False,
+                output_hidden_states=False,
+                return_dict=True,
+            )
+            if not hasattr(llava_outputs, "last_hidden_state"):
+                raise ValueError("LLaVA backbone output does not contain last_hidden_state")
+            new_hidden_states = llava_outputs.last_hidden_state
             new_last_hidden_states = new_hidden_states[
                 torch.arange(len(last_token_indices), device=new_hidden_states.device),
                 torch.tensor(last_token_indices, dtype=torch.long, device=new_hidden_states.device),
@@ -555,11 +626,22 @@ def main():
                 batch_samples=batch_samples,
                 soft_prompt=soft_prompt,
             )
-            new_hidden_states = model(
-                inputs_embeds=inputs_embeds,
-                attention_mask=attention_mask,
-                output_hidden_states=True,
-            ).hidden_states[-1]
+            if hasattr(model, "model"):
+                new_hidden_states = model.model(
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=attention_mask,
+                    use_cache=False,
+                    output_hidden_states=False,
+                    return_dict=True,
+                ).last_hidden_state
+            else:
+                new_hidden_states = model(
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=attention_mask,
+                    use_cache=False,
+                    output_hidden_states=True,
+                    return_dict=True,
+                ).hidden_states[-1]
             new_last_hidden_states = new_hidden_states[
                 torch.arange(len(last_token_indices), device=new_hidden_states.device),
                 torch.tensor(last_token_indices, dtype=torch.long, device=new_hidden_states.device),
@@ -567,7 +649,20 @@ def main():
         else:
             batch_messages = [e["messages"] for e in batch_samples]
             inputs_embeds, new_input_lengths = embed_soft_prompt(model, toker, batch_messages, soft_prompt)
-            new_hidden_states = model(inputs_embeds=inputs_embeds, output_hidden_states=True).hidden_states[-1]
+            if hasattr(model, "model"):
+                new_hidden_states = model.model(
+                    inputs_embeds=inputs_embeds,
+                    use_cache=False,
+                    output_hidden_states=False,
+                    return_dict=True,
+                ).last_hidden_state
+            else:
+                new_hidden_states = model(
+                    inputs_embeds=inputs_embeds,
+                    use_cache=False,
+                    output_hidden_states=True,
+                    return_dict=True,
+                ).hidden_states[-1]
             new_last_hidden_states = new_hidden_states[
                 torch.arange(len(new_input_lengths), device=new_hidden_states.device),
                 torch.tensor(new_input_lengths, dtype=torch.long, device=new_hidden_states.device) - 1,
@@ -589,27 +684,68 @@ def main():
         elif args.ablate_norm:
             total_loss = refusal_loss + harmfulness_loss * 1e-2
         else:
-            total_loss = refusal_loss + harmfulness_loss * 1e-2 + norm_loss * 1e-3
+           #gr_refu = torch.autograd.grad(refusal_loss, soft_prompt, retain_graph=True, allow_unused=False)[0]
+           #gr_harm = torch.autograd.grad(harmfulness_loss * 1e-2, soft_prompt, retain_graph=True, allow_unused=False)[0]
+           #gr_norm = torch.autograd.grad(norm_loss * 1e-3, soft_prompt, retain_graph=True, allow_unused=False)[0]
 
-        total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(soft_prompt, 1.0)
-        optimizer.step()
-        step += 1
+           #logging.info(
+           #    f"grad_norms | "
+           #    f"refu={gr_refu.norm().item():.6e}, "
+           #    f"harm={gr_harm.norm().item():.6e}, "
+           #    f"norm={gr_norm.norm().item():.6e}"
+           #)
+            total_loss = 1* refusal_loss + harmfulness_loss * 1e-2 + norm_loss * 1e-3
 
-        if step % 10 == 0:
-            logging.info(f'Step {step}, refusal_loss {refusal_loss.cpu().item()}, harmfulness_loss {harmfulness_loss.cpu().item()}, norm_loss {norm_loss.cpu().item()}')
+        # Accumulate per-sample summed gradients, then normalize once before stepping.
+        (total_loss * batch_sample_count).backward()
+        accumulated_samples += batch_sample_count
+        accumulated_total_loss += total_loss.detach().float().item() * batch_sample_count
+        accumulated_refusal_loss += refusal_loss.detach().float().item() * batch_sample_count
+        accumulated_harmfulness_loss += harmfulness_loss.detach().float().item() * batch_sample_count
+        accumulated_norm_loss += norm_loss.detach().float().item() * batch_sample_count
+
+        is_last_batch_in_epoch = (micro_step_idx % batches_per_epoch) == 0
+        should_step = accumulated_samples >= target_effective_batch_size or is_last_batch_in_epoch
+        if should_step:
+            if soft_prompt.grad is not None:
+                soft_prompt.grad.div_(accumulated_samples)
+            torch.nn.utils.clip_grad_norm_(soft_prompt, 1.0)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            step += 1
+
+            mean_total_loss = accumulated_total_loss / accumulated_samples
+            mean_refusal_loss = accumulated_refusal_loss / accumulated_samples
+            mean_harmfulness_loss = accumulated_harmfulness_loss / accumulated_samples
+            mean_norm_loss = accumulated_norm_loss / accumulated_samples
+
+            accumulated_samples = 0
+            accumulated_total_loss = 0.0
+            accumulated_refusal_loss = 0.0
+            accumulated_harmfulness_loss = 0.0
+            accumulated_norm_loss = 0.0
+
+            if step % 10 == 0:
+                logging.info(
+                    f'Step {step}, total_loss {mean_total_loss}, refusal_loss {mean_refusal_loss}, '
+                    f'harmfulness_loss {mean_harmfulness_loss}, norm_loss {mean_norm_loss}'
+                )
 
     soft_prompt = soft_prompt.detach()
+    save_stem = f'type.{args.system_prompt_type}_length.{args.prompt_length}'
     if args.ablate_norm:
-        save_file({'soft_prompt': soft_prompt}, f'{args.output_path}/{model_name}/type.{args.system_prompt_type}_length.{args.prompt_length}_nonorm.safetensors')
+        save_stem += '_nonorm'
     elif args.ablate_refu:
-        save_file({'soft_prompt': soft_prompt}, f'{args.output_path}/{model_name}/type.{args.system_prompt_type}_length.{args.prompt_length}_norefu.safetensors')
+        save_stem += '_norefu'
     elif args.ablate_harm:
-        save_file({'soft_prompt': soft_prompt}, f'{args.output_path}/{model_name}/type.{args.system_prompt_type}_length.{args.prompt_length}_noharm.safetensors')
-    else:
-        save_file({'soft_prompt': soft_prompt}, f'{args.output_path}/{model_name}/type.{args.system_prompt_type}_length.{args.prompt_length}.safetensors')
+        save_stem += '_noharm'
+    if suffix is not None:
+        save_stem += f'__{suffix}'
+    save_path = f'{model_output_dir}/{save_stem}.safetensors'
+    save_file({'soft_prompt': soft_prompt}, save_path)
 
     logging.info(f"Training finished")
+    logging.info(f"Saved soft prompt to: {save_path}")
 
     logging_cuda_memory_usage()
     torch.cuda.empty_cache()

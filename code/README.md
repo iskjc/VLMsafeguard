@@ -1,34 +1,29 @@
-# README
+# Code Layout
 
-You can find the scripts of running LLMs with human-crafted safety prompts and training continuous safety prompts in `scripts`. Note that for local running you should set the env variable `HF_MODELS` that indicates the save folder of LLMs.
+Multimodal entry points now live in [`scripts/multimodal`](/home/srj/VLMsafeguard/code/scripts/multimodal).
 
+Key directories:
 
-## How to Run Code
+- [`outputs`](/home/srj/VLMsafeguard/code/outputs): generation results grouped by dataset
+- [`eval_results`](/home/srj/VLMsafeguard/code/eval_results): evaluation artifacts grouped by dataset
+- [`scripts/multimodal`](/home/srj/VLMsafeguard/code/scripts/multimodal): active multimodal train / generate / eval scripts
 
-To get generation and evaluation results with **human-crafted safety prompts**, run:
+Common workflows:
 
-```sh
-bash scripts/run_mistral-v1.sh
-bash scripts/run_mistral-v1_harmless.sh
-```
+- Train soft prompt:
+  `bash code/scripts/multimodal/train_soft_prompt_mm.sh`
+- Run MME:
+  `bash code/scripts/multimodal/generate_mme_hard.sh`
+  `bash code/scripts/multimodal/generate_mme_soft.sh`
+- Export + score MME:
+  `python3 code/scripts/multimodal/export_mme_for_eval_tool.py ...`
+  `bash code/scripts/multimodal/eval_mme_results.sh code/eval_results/mme/soft_for_eval_tool /s/datasets/MME/eval_tool`
+- Run VLGuard test:
+  `bash code/scripts/multimodal/generate_vlguard_test_hard.sh`
+  `bash code/scripts/multimodal/generate_vlguard_test_soft.sh`
+  `bash code/scripts/multimodal/eval_vlguard_compare.sh`
+- Run GQA:
+  `bash code/scripts/multimodal/generate_gqa_hard.sh`
+  `bash code/scripts/multimodal/eval_gqa_answer_match.sh`
 
-To train **continuous safety prompts**, and then get generation and evaluation results, run:
-
-```sh
-bash scripts/forward.sh
-bash scripts/forward_harmless.sh
-bash scripts/train_mistral-v1.sh
-```
-
-You may uncomment the *unlikelihood* line to reproduce the *vanilla Prompt Tuning* baseline.
-
-To **visualize the hidden states with estimated boundaries**, run:
-
-```sh
-bash scripts/compare_gather.sh
-```
-
-
-## Acknowledgement
-
-Our code base builds upon the follow repository: https://github.com/Princeton-SysML/Jailbreak_LLM
+COCO2014 wrappers are included, but they expect you to provide a prepared `mm_jsonl` file, for example by overriding `MM_JSONL`.
