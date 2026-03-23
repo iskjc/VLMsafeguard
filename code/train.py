@@ -694,7 +694,7 @@ def main():
            #    f"harm={gr_harm.norm().item():.6e}, "
            #    f"norm={gr_norm.norm().item():.6e}"
            #)
-            total_loss = 1* refusal_loss + harmfulness_loss * 1e-2 + norm_loss * 1e-3
+            total_loss = 1* refusal_loss + harmfulness_loss * 1e-2 + norm_loss * 1e-2
 
         # Accumulate per-sample summed gradients, then normalize once before stepping.
         (total_loss * batch_sample_count).backward()

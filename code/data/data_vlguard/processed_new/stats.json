@@ -1,0 +1,43 @@
+{
+  "audit": {
+    "total_samples": 4535,
+    "total_groups": 2991,
+    "label_counts": {
+      "0": 3000,
+      "1": 1535
+    },
+    "mixed_label_groups": 1531,
+    "mixed_label_rows": 3071,
+    "safe_rows_on_mixed_groups": 1535,
+    "unsafe_rows_on_mixed_groups": 1536,
+    "duplicate_questions": 210,
+    "duplicates_removed": 0,
+    "conflicting_pairs": 0
+  },
+  "split": {
+    "train": {
+      "total": 2608,
+      "unsafe": 1304,
+      "safe": 1304,
+      "groups": 1935
+    },
+    "test": {
+      "total": 682,
+      "unsafe": 451,
+      "safe": 231,
+      "groups": 449
+    },
+    "group_overlap": 0,
+    "actual_train_ratio": 0.5750826901874311,
+    "actual_test_ratio": 0.1503858875413451
+  },
+  "config": {
+    "raw_dir": "code/data/data_vlguard/raw",
+    "image_root": "code/data/data_vlguard/images",
+    "out_dir": "code/data/data_vlguard/processed_new",
+    "train_ratio": 0.85,
+    "seed": 42,
+    "audit_only": false,
+    "split_strategy": "grouped_by_image_path_profile_bucket_split"
+  }
+}

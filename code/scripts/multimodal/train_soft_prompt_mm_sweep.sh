@@ -15,12 +15,10 @@ DEFAULT_EFFECTIVE_BATCH_SIZE="${EFFECTIVE_BATCH_SIZE:-40}"
 # Format per row:
 # run_name learning_rate num_epochs batch_size effective_batch_size
 RUNS=(
-  "lr1e-5_ep10_ebs80_rl1 1e-5 10 2 80"
-  "lr1e-4_ep10_ebs80_rl1 1e-4 10 2 80"
-  "lr1e-5_ep10_ebs40_rl1 1e-5 10 2 40"
-  "lr1e-5_ep15_ebs80_rl1 1e-5 15 2 80"
-  "lr1e-4_ep10_ebs40_rl1 1e-4 10 2 40"
-  "lr1e-5_ep5_ebs80_rl1 1e-5 5 2 80"
+  "lr1e-5_ep10_ebs40_nl-2 1e-5 10 2 40"
+  "lr1e-5_ep10_ebs40_nl-2 1e-5 15 2 40"
+  "lr1e-4_ep10_ebs40_nl-2 1e-4 10 2 40"
+  "lr1e-4_ep10_ebs40_nl-2 1e-4 15 2 40"
 )
 
 

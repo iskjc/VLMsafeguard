@@ -208,6 +208,18 @@ def stratified_group_split(samples: List[Dict[str, Any]], train_ratio: float, se
     return train_samples, test_samples
 
 
+def balance_train_set(train_samples: List[Dict[str, Any]], seed: int) -> List[Dict[str, Any]]:
+    rng = random.Random(seed)
+    safe = [s for s in train_samples if s['label'] == 1]
+    unsafe = [s for s in train_samples if s['label'] == 0]
+    rng.shuffle(unsafe)
+    num_safe = len(safe)
+    balanced_unsafe = unsafe[:num_safe]
+    balanced_train = safe + balanced_unsafe
+    rng.shuffle(balanced_train)
+    return balanced_train
+
+
 def split_summary(rows: List[Dict[str, Any]]) -> Dict[str, int]:
     label_counts = Counter(row["label"] for row in rows)
     return {
@@ -216,6 +228,30 @@ def split_summary(rows: List[Dict[str, Any]]) -> Dict[str, int]:
         "safe": int(label_counts.get(1, 0)),
         "groups": len({row["image_path"] for row in rows}),
     }
+
+
+def balanced_label_truncate(samples: List[Dict[str, Any]], max_label0: Optional[int], max_label1: Optional[int], seed: int):
+    rng = random.Random(seed)
+    grouped = {0: [], 1: []}
+    for sample in samples:
+        grouped[sample["label"]].append(sample)
+
+    for label in (0, 1):
+        rng.shuffle(grouped[label])
+
+    limit0 = max_label0 if max_label0 is not None else len(grouped[0])
+    limit1 = max_label1 if max_label1 is not None else len(grouped[1])
+
+    train0 = grouped[0][:limit0]
+    test0 = grouped[0][limit0:]
+    train1 = grouped[1][:limit1]
+    test1 = grouped[1][limit1:]
+
+    train_samples = train0 + train1
+    test_samples = test0 + test1
+    rng.shuffle(train_samples)
+    rng.shuffle(test_samples)
+    return train_samples, test_samples
 
 
 def write_jsonl(path: Path, rows: List[Dict[str, Any]]):
@@ -237,6 +273,10 @@ def main():
     parser.add_argument("--image_root", type=str, required=True)
     parser.add_argument("--out_dir", type=str, required=True)
     parser.add_argument("--train_ratio", type=float, default=0.8)
+    parser.add_argument("--max_train_label0", type=int, default=None,
+                        help="If set, keep at most this many label=0 samples in train; rest goes to test")
+    parser.add_argument("--max_train_label1", type=int, default=None,
+                        help="If set, keep at most this many label=1 samples in train; rest goes to test")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--audit_only", action="store_true")
     args = parser.parse_args()
@@ -265,7 +305,18 @@ def main():
     audit.update(dedupe_info)
     audit["conflicting_pairs"] = len(conflicts)
 
-    train_samples, test_samples = stratified_group_split(samples, args.train_ratio, args.seed)
+    if args.max_train_label0 is not None or args.max_train_label1 is not None:
+        train_samples, test_samples = balanced_label_truncate(
+            samples,
+            max_label0=args.max_train_label0,
+            max_label1=args.max_train_label1,
+            seed=args.seed,
+        )
+    else:
+        train_samples, test_samples = stratified_group_split(samples, args.train_ratio, args.seed)
+        # 平衡训练集以达到 safe:unsafe = 1:1
+        train_samples = balance_train_set(train_samples, args.seed)
+
     split_stats = {
         "train": split_summary(train_samples),
         "test": split_summary(test_samples),
